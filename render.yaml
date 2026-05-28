@@ -1,0 +1,100 @@
+# Render Blueprint — one-click deploy for the HVT+Fatty cleanup bot.
+# https://render.com/docs/blueprint-spec
+#
+# After clicking "New Blueprint Instance" in Render and pointing it at this
+# repo, Render auto-creates:
+#   1. A web service running gunicorn (for /run-on-demand + /status polling)
+#   2. A cron job that runs python main.py every Sunday at 23:00 UTC
+#
+# Both services share the same Docker image (Playwright + Python deps baked
+# in). You'll be prompted to set the secret env vars once.
+
+services:
+  - type: web
+    name: hvt-fatty-cleanup-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter                    # Docker plans don't have a free tier on Render
+    region: virginia                 # Match the other ddbf services
+    branch: main
+    healthCheckPath: /
+    # Override the Dockerfile CMD to bind to Render's $PORT.
+    dockerCommand: gunicorn app:app --workers 1 --threads 4 --timeout 600 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: LOFTY_API_KEY
+        sync: false                  # Render will prompt for this (secret)
+      - key: SLACK_WEBHOOK_URL
+        sync: false                  # Render will prompt for this (secret)
+      - key: ANTHROPIC_API_KEY
+        sync: false                  # Render will prompt for this (secret)
+      - key: STAGE_HVT
+        value: "606230"
+      - key: STAGE_FATTY
+        value: "606229"
+      - key: STAGE_VAULT_HOT_OCC_ALIVE
+        value: "428742"
+      - key: DRY_RUN
+        value: "0"
+      - key: AUTO_MOVE
+        value: "1"
+      - key: CLEANUP_LIMIT
+        value: "0"
+      - key: PAYMENT_VAULT_THRESHOLD
+        value: "1000"
+
+  - type: cron
+    name: hvt-fatty-cleanup-cron
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: virginia
+    branch: main
+    # Sunday 23:00 UTC = Sunday 6pm Central (CDT) / 5pm CST.
+    # Same window as hot-occ-alive-cleanup.
+    schedule: "0 23 * * 0"
+    # Override the Dockerfile CMD: cron runs the script directly.
+    dockerCommand: python main.py
+    envVars:
+      # Cron job reads the SAME env vars as the web service. Use
+      # fromService to copy them automatically instead of re-pasting.
+      - key: LOFTY_API_KEY
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: LOFTY_API_KEY
+      - key: SLACK_WEBHOOK_URL
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: SLACK_WEBHOOK_URL
+      - key: ANTHROPIC_API_KEY
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: ANTHROPIC_API_KEY
+      - key: STAGE_HVT
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: STAGE_HVT
+      - key: STAGE_FATTY
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: STAGE_FATTY
+      - key: STAGE_VAULT_HOT_OCC_ALIVE
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: STAGE_VAULT_HOT_OCC_ALIVE
+      - key: PAYMENT_VAULT_THRESHOLD
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: PAYMENT_VAULT_THRESHOLD
+      - key: DRY_RUN
+        value: "0"
+      - key: AUTO_MOVE
+        value: "1"
+      - key: CLEANUP_LIMIT
+        value: "0"
