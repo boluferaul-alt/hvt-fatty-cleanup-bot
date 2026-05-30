@@ -35,6 +35,33 @@ DISCOVER_SYSTEM = (
 )
 
 
+# Hand-verified URLs for counties where the LLM has been observed to
+# hallucinate or get the URL subtly wrong (typos, dropped hyphens,
+# pointing at the CAD appraisal site instead of the Tax A&C site).
+# These are tried FIRST in candidates so discovery doesn't waste an
+# LLM round-trip. Form selectors are still discovered by the LLM
+# from the live page.
+#
+# Keys must match _county_key() output (uppercased, no " COUNTY" suffix).
+KNOWN_COUNTY_URLS: dict[str, list[str]] = {
+    "SAN JACINTO": [
+        "https://actweb.acttax.com/act_webdev/sanjacinto/index.jsp",
+    ],
+    "BRAZORIA": [
+        "https://actweb.acttax.com/act_webdev/brazoria/index.jsp",
+    ],
+    "LIBERTY": [
+        "https://www.libertycountytax.com/property-search",
+    ],
+    "TAYLOR": [
+        "https://actweb.acttax.com/act_webdev/taylor/index.jsp",
+    ],
+    "POLK": [
+        "https://actweb.acttax.com/act_webdev/polk/index.jsp",
+    ],
+}
+
+
 def load_playbooks(path: Path | str = DEFAULT_PLAYBOOK_PATH) -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -97,8 +124,12 @@ async def discover_county_playbook(county: str, llm: LLM, browser: Browser) -> d
 
     context = await browser.new_context()
     page = await context.new_page()
-    candidates = [proposed["search_url"]]
-    if proposed.get("backup_search_url"):
+    # Hand-verified URLs win over LLM-proposed ones. Tried first.
+    known = KNOWN_COUNTY_URLS.get(_county_key(county), [])
+    candidates: list[str] = list(known)
+    if proposed["search_url"] not in candidates:
+        candidates.append(proposed["search_url"])
+    if proposed.get("backup_search_url") and proposed["backup_search_url"] not in candidates:
         candidates.append(proposed["backup_search_url"])
 
     for url in candidates:
