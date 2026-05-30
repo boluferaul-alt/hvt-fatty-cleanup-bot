@@ -109,24 +109,30 @@ class LoftyClient:
         resp.raise_for_status()
         return resp.json()
 
-    def list_leads_in_stage(self, stage_id: int, limit: int = 200,
-                            max_pages: int = 50) -> list[dict]:
+    def list_leads_in_stages(self, stage_ids: list[int],
+                             limit: int = 100,
+                             max_pages: int = 500) -> dict[int, list[dict]]:
         """
-        Return every lead currently in `stage_id`. Paginates until either:
-          - a page comes back empty (end of pipeline), or
-          - we've hit max_pages * limit total (safety cap), or
-          - we've collected fewer leads than requested on a page (last page).
+        Single-pass variant of list_leads_in_stage that buckets leads for
+        multiple target stages from one walk of the /leads endpoint.
+        Returns {stage_id: [leads, ...]} for each requested stage_id.
 
-        Lofty's /leads endpoint with stageId param appears to honor it on
-        this account based on the existing lofty-bot's behavior. If a future
-        version stops honoring it, we filter client-side as a safety net.
+        Lofty's /leads endpoint quirks (observed 2026-05-30):
+          - `stageId=` query param is silently ignored; filter client-side.
+          - `limit` is hard-capped at 100. limit>100 returns 0 (not error).
+          - The endpoint surfaces ~35K leads in workspace order. Real
+            pipeline-assigned leads are scattered throughout offset range.
+            Must scan the full set to find every lead in a given stage.
         """
-        all_leads: list[dict] = []
+        if limit > 100:
+            limit = 100
+        targets = set(stage_ids)
+        out: dict[int, list[dict]] = {sid: [] for sid in stage_ids}
         page = 0
+        empty_streak = 0
         while page < max_pages:
             offset = page * limit
             resp = self._request("GET", "/leads", params={
-                "stageId": stage_id,
                 "offset": offset,
                 "limit": limit,
             })
@@ -134,12 +140,70 @@ class LoftyClient:
                 break
             batch = self._extract_list(resp.json())
             if not batch:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    break
+                page += 1
+                continue
+            empty_streak = 0
+            for ld in batch:
+                sid = ld.get("stageId")
+                if sid in targets:
+                    out[sid].append(ld)
+            if len(batch) < limit:
+                break  # genuine last page
+            page += 1
+        return out
+
+    def list_leads_in_stage(self, stage_id: int, limit: int = 100,
+                            max_pages: int = 500) -> list[dict]:
+        """
+        Return every lead currently in `stage_id`. Paginates the global
+        /leads endpoint and filters client-side by stageId.
+
+        Lofty's /leads endpoint quirks (observed 2026-05-30):
+          - The `stageId=` query param is silently ignored by the server,
+            so we MUST filter client-side.
+          - `limit` is hard-capped at 100. Passing limit>100 returns 0
+            leads (not an error, just empty). Stay at 100.
+          - The endpoint surfaces ~35K leads in workspace order. Real
+            pipeline-assigned leads are NOT concentrated near the top;
+            they're scattered throughout the offset range. Need to scan
+            the full set to find every lead in a given stage.
+
+        Defensive caps:
+          - max_pages * limit = 50,000 (safely covers ~36K workspace)
+          - bails early if a page comes back empty (true end of list)
+          - bails early if API returns non-200
+        """
+        if limit > 100:
+            limit = 100  # API caps at 100 — anything higher returns []
+        all_leads: list[dict] = []
+        page = 0
+        empty_streak = 0
+        while page < max_pages:
+            offset = page * limit
+            resp = self._request("GET", "/leads", params={
+                "stageId": stage_id,   # server ignores, but harmless
+                "offset": offset,
+                "limit": limit,
+            })
+            if resp.status_code != 200:
                 break
-            # Defensive filter: if the server ignored stageId, drop mismatches.
+            batch = self._extract_list(resp.json())
+            if not batch:
+                # One empty page might just be a stage-less range; tolerate
+                # a short streak of empties before giving up.
+                empty_streak += 1
+                if empty_streak >= 3:
+                    break
+                page += 1
+                continue
+            empty_streak = 0
             in_stage = [ld for ld in batch if ld.get("stageId") == stage_id]
             all_leads.extend(in_stage)
             if len(batch) < limit:
-                break  # last page
+                break  # genuine last page
             page += 1
         return all_leads
 

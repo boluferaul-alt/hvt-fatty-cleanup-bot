@@ -220,14 +220,15 @@ async def run_cleanup_async() -> dict:
     print(f"Authenticated as {me.get('firstName')} {me.get('lastName')} "
           f"(userId={me.get('id')})")
 
-    # Pull leads from both source pipelines.
-    print(f"\nListing leads in stageId={STAGE_HVT} (HVT)...")
-    hvt_leads = client.list_leads_in_stage(STAGE_HVT)
-    print(f"Found {len(hvt_leads)} HVT lead(s).")
-
-    print(f"\nListing leads in stageId={STAGE_FATTY} (Fatty)...")
-    fatty_leads = client.list_leads_in_stage(STAGE_FATTY)
-    print(f"Found {len(fatty_leads)} Fatty lead(s).")
+    # Pull leads from both source pipelines in a single API walk.
+    # Lofty's /leads endpoint requires scanning the full workspace (~36K
+    # leads) since the server-side stageId filter is ignored, so we
+    # bucket both stages in one pass instead of two.
+    print(f"\nListing leads in stages {STAGE_HVT} (HVT) and {STAGE_FATTY} (Fatty) — single pass...")
+    buckets = client.list_leads_in_stages([STAGE_HVT, STAGE_FATTY])
+    hvt_leads = buckets.get(STAGE_HVT, [])
+    fatty_leads = buckets.get(STAGE_FATTY, [])
+    print(f"Found {len(hvt_leads)} HVT lead(s) and {len(fatty_leads)} Fatty lead(s).")
 
     # Tag each lead with its source pipeline for the report.
     tagged: list[tuple[str, dict]] = (
