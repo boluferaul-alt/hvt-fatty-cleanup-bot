@@ -23,6 +23,7 @@ Designed to be called either:
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import time
 import traceback
@@ -254,10 +255,40 @@ async def run_cleanup_async() -> dict:
     rows: list[dict] = []
     errors: list[tuple[Any, str, str]] = []
 
+    # Chromium leaks ~10-15MB per browser-context cycle even after close().
+    # Render Starter = 512MB total. To avoid OOM on a 100+ lead run, we
+    # restart the whole browser process every BROWSER_REFRESH_EVERY leads
+    # and force a Python GC pass. Empirically OOM hits around lead ~30 at
+    # 512MB without this; refresh every 15 keeps peak well under 350MB.
+    BROWSER_REFRESH_EVERY = 15
+    LOW_MEM_ARGS = [
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--no-sandbox",
+        "--no-zygote",
+    ]
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = None
         try:
             for i, (source, lead) in enumerate(tagged, start=1):
+                # Restart browser at start of run + every N leads.
+                if browser is None or (i - 1) % BROWSER_REFRESH_EVERY == 0:
+                    if browser is not None:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        gc.collect()
+                        print(f"  [memory] browser restart (lead #{i})")
+                    browser = await pw.chromium.launch(
+                        headless=True, args=LOW_MEM_ARGS,
+                    )
+
                 try:
                     row = await process_one_lead_async(
                         client, lead, source, browser, llm, playbooks,
@@ -271,7 +302,11 @@ async def run_cleanup_async() -> dict:
                 if i % 10 == 0:
                     print(f"  [{i}/{len(tagged)}] processed so far...")
         finally:
-            await browser.close()
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     elapsed = time.time() - started
 
