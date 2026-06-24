@@ -113,6 +113,9 @@ class ParsedSummary:
 
     # Recent activity signals
     tax_paid_last_12mo: Optional[bool] = None   # From "Tax Paid Last 12 Months: YES/NO"
+    paid_amount: Optional[float] = None         # From "How Much Paid: $X"
+    property_id: str = ""                        # CAD/Property Id (for county scraping)
+    owner_status_basis: str = ""                 # how owner alive/deceased was decided
 
 
 # ----------------------------------------------------------------------
@@ -169,6 +172,83 @@ def _field(text: str, *patterns: str) -> str:
     return ""
 
 
+def _normalize_note(s: str) -> str:
+    """Lofty notes are HTML (<br>, <p>, &nbsp;) with everything on one line.
+    Convert tags to newlines so line-anchored field regexes don't over-capture."""
+    if not s:
+        return ""
+    s = re.sub(r"<\s*br\s*/?\s*>", "\n", s, flags=re.I)
+    s = re.sub(r"</?\s*p\s*>", "\n", s, flags=re.I)
+    s = re.sub(r"</?\s*div\s*>", "\n", s, flags=re.I)
+    s = s.replace("&nbsp;", " ").replace("&amp;", "&").replace("\xa0", " ")
+    s = re.sub(r"<[^>]+>", " ", s)        # strip any remaining tags
+    return s
+
+
+def _amount_after(text: str, *labels: str) -> Optional[float]:
+    """Grab the dollar amount immediately after a label (tight — avoids
+    sweeping up a later field's number on glued one-line notes)."""
+    for lab in labels:
+        m = re.search(lab + r"\s*:?\s*\$?\s*([\d,]+(?:\.\d+)?)", text, re.I)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    return None
+
+
+# --- Owner-of-record alive/deceased detector (Raul's 2026-06-24 rules) ---
+def _owner_first(owner: str, note: str) -> str:
+    o = owner or ""
+    if not o:
+        m = re.search(r"Owner(?: Name)?:\s*([A-Za-z][A-Za-z ,.&]+)", note, re.I)
+        o = m.group(1) if m else ""
+    toks = [w for w in re.findall(r"[A-Za-z]+", o.upper())
+            if len(w) > 1 and w not in ("ETAL", "ETUX", "ESTATE", "EST", "THE",
+                                        "LLC", "TRUST", "LIFE", "LF", "JR", "SR")]
+    return toks[1] if len(toks) >= 2 else (toks[0] if toks else "")
+
+
+def owner_status(note: str, owner: str, vacant: Optional[bool]) -> tuple[str, str]:
+    """Return (status, why) for the OWNER OF RECORD only — ignore dead
+    co-owners/heirs. Priority order is Raul's. Falls back to the vacancy
+    tiebreaker (vacant -> deceased/HVT, occupied -> alive) when ambiguous."""
+    t = note
+    fn = _owner_first(owner, t)
+    if re.search(r"ALIVE\s*\(\s*owner\b", t, re.I):
+        return "alive", 'explicit "ALIVE (owner)" line'
+    if fn and re.search(r"\d\s*y\.?o\.?\s*LIVING", t, re.I):
+        m = re.search(re.escape(fn) + r"[^\n]{0,55}\d{1,3}\s*y\.?o\.?\s*(LIVING|DECEASED)", t, re.I)
+        if m:
+            return ("deceased" if m.group(1).upper() == "DECEASED" else "alive"), "owner age tag"
+    if fn:  # owner appears in the Alive list (notes glue words: "AliveJAMES...")
+        am = re.search(r"Alive", t, re.I)
+        if am:
+            after = t[am.end():]
+            end = len(after)
+            for mk in (r"Bot Deceased", r"DECEASED STATUS", r"Possible associate", r"\bDeceased\b"):
+                mm = re.search(mk, after, re.I)
+                if mm:
+                    end = min(end, mm.start())
+            if re.search(re.escape(fn), after[:min(end, 700)], re.I):
+                return "alive", "owner in Alive list"
+    if re.search(r"\bEST(ATE)?\b", owner or "", re.I):
+        return "deceased", "owner name contains ESTATE"
+    if re.search(r"(?:CONFIRMED|DECEASED)\s*\(\s*owner\b", t, re.I):
+        return "deceased", 'explicit "(owner) DECEASED" line'
+    if re.search(r"Bot Deceased Finding:\s*CONFIRMED", t, re.I):
+        return "deceased", "Bot Deceased Finding CONFIRMED"
+    if re.search(r"no deceased confirmed|RESCUE\s*[—-]\s*no deceased", t, re.I):
+        return "alive", "rescue / no deceased"
+    # Ambiguous -> occupancy tiebreaker
+    if vacant is True:
+        return "deceased", "inferred: vacant + ambiguous"
+    if vacant is False:
+        return "alive", "inferred: occupied + ambiguous"
+    return "unconfirmed", "no clear signal"
+
+
 def parse_summary(note_content: str) -> ParsedSummary:
     """
     Parse a single note's content into a structured ParsedSummary.
@@ -186,7 +266,7 @@ def parse_summary(note_content: str) -> ParsedSummary:
         return out
     out.found = True
 
-    text = note_content
+    text = _normalize_note(note_content)
 
     # ---- Bot recommendation + status (top of note) ----
     out.bot_recommendation = _field(
@@ -241,10 +321,8 @@ def parse_summary(note_content: str) -> ParsedSummary:
         out.is_vacant_land = True
 
     # ---- Tax ----
-    out.total_owed = _parse_money(_field(
-        text,
-        r"Total\s*(?:Due|Owed|Taxes\s+Owed):\s*([^\n]+)",
-    ))
+    out.total_owed = _amount_after(
+        text, r"Total\s*Taxes?\s*Owed", r"Total\s*Due", r"Total\s*Owed")
     out.years_behind = _parse_years(_field(
         text,
         r"Years\s*Behind(?:\s*Tax)?:\s*([^\n]+)",
@@ -264,62 +342,15 @@ def parse_summary(note_content: str) -> ParsedSummary:
             out.tax_lawsuit = lawsuit_str.strip()
             out.has_lawsuit = True
 
-    # ---- Valuation ----
-    out.assessed_value = _parse_money(_field(
-        text,
-        r"Assessed\s*Value:\s*([^\n]+)",
-        r"County\s*Assessed:\s*([^\n]+)",
-        r"Appraised\s*Value:\s*([^\n]+)",
-    ))
-    out.zillow_zestimate = _parse_money(_field(
-        text,
-        r"Zillow\s*Z?estimate:\s*([^\n]+)",
-        r"Zillow\s*EST:\s*([^\n]+)",
-        r"Zillow\s*Est:\s*([^\n]+)",
-    ))
-    out.market_value = _parse_money(_field(
-        text,
-        r"Market\s*Value:\s*([^\n]+)",
-    ))
+    # ---- Valuation (tight $-after-label to avoid grabbing a later field) ----
+    out.assessed_value = _amount_after(
+        text, r"Appraised\s*Value", r"Assessed\s*Value", r"County\s*Assessed")
+    out.zillow_zestimate = _amount_after(
+        text, r"Zillow\s*Z?est(?:imate)?\.?", r"Zillow\s*EST")
+    out.market_value = _amount_after(text, r"Market\s*Value")
 
-    # ---- Owner status ----
-    # Patterns vary: "OWNER STATUS: Name — DECEASED", "Deceased: Yes",
-    # bare "DECEASED" / "Alive" lines, "Confirmed Deceased - ...".
-    status_block = _field(
-        text,
-        r"OWNER\s*STATUS:\s*([^\n]+(?:\n[^\n]+)?)",
-    )
-    if status_block:
-        low = status_block.lower()
-        if "deceased" in low:
-            out.owner_status = "deceased"
-            out.deceased_confirmed = True
-        elif "alive" in low:
-            out.owner_status = "alive"
-        else:
-            out.owner_status = "unconfirmed"
-    else:
-        # Look for standalone markers.
-        upper = text.upper()
-        if re.search(r"\bDECEASED\b", upper) and "NOT DECEASED" not in upper:
-            out.owner_status = "deceased"
-            out.deceased_confirmed = True
-        elif re.search(r"\bALIVE\b", upper):
-            out.owner_status = "alive"
-        else:
-            out.owner_status = "unconfirmed"
-
-    # Explicit "Deceased: Yes / No / Unknown" line wins over standalone marker.
-    deceased_line = _field(text, r"Deceased:\s*([^\n]+)")
-    if deceased_line:
-        low = deceased_line.strip().lower()
-        if low.startswith("yes") or low.startswith("confirmed"):
-            out.owner_status = "deceased"
-            out.deceased_confirmed = True
-        elif low.startswith("no"):
-            out.owner_status = "alive"
-            out.deceased_confirmed = False
-        # "Unconfirmed" / "Unknown" — leave whatever standalone markers picked.
+    # ---- Owner status is decided AFTER occupancy below (it uses the
+    #      vacant/occupied tiebreaker for ambiguous notes). ----
 
     # ---- Occupancy ----
     occ = _field(
@@ -341,6 +372,10 @@ def parse_summary(note_content: str) -> ParsedSummary:
         elif low.startswith("no"):
             out.occupancy = "VACANT"
             out.is_vacant = True
+
+    # ---- Owner of record alive/deceased (owner-only; uses vacancy tiebreak) ----
+    out.owner_status, out.owner_status_basis = owner_status(text, out.owner_name, out.is_vacant)
+    out.deceased_confirmed = (out.owner_status == "deceased")
 
     # ---- Heirs ----
     heirs_section = _field(
@@ -364,7 +399,7 @@ def parse_summary(note_content: str) -> ParsedSummary:
         elif low.startswith("no") or low == "n":
             out.homestead = False
 
-    # ---- Tax paid last 12 months ----
+    # ---- Tax paid last 12 months + how much (Researcher already scraped this) ----
     paid = _field(text, r"Tax\s*Paid\s*Last\s*12\s*Months?:\s*([^\n]+)")
     if paid:
         low = paid.strip().lower()
@@ -372,6 +407,14 @@ def parse_summary(note_content: str) -> ParsedSummary:
             out.tax_paid_last_12mo = True
         elif low.startswith("no"):
             out.tax_paid_last_12mo = False
+    out.paid_amount = _amount_after(text, r"How\s*Much\s*Paid")
+
+    # ---- Property / CAD id (for county tax lookups) ----
+    out.property_id = _field(
+        text,
+        r"Property\s*Id\s*:?\s*([0-9][0-9.\-]*)",
+        r"CAD\s*/?\s*Property\s*ID\s*:?\s*([0-9][0-9.\-]*)",
+    )
 
     return out
 

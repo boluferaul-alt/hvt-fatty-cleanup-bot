@@ -77,6 +77,11 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 # reviews the report and moves the leads himself.
 AUTO_MOVE = os.getenv("AUTO_MOVE", "0") == "1"
 CLEANUP_LIMIT = int(os.getenv("CLEANUP_LIMIT", "0"))
+# The Researcher already wrote Total Taxes Owed + How Much Paid into each note,
+# so we decide off that by default. The generic live county scraper is flaky
+# (reCAPTCHA portals, selector drift) — only enable it once per-county handlers
+# are solid.
+USE_LIVE_TAX = os.getenv("USE_LIVE_TAX", "0") == "1"
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
@@ -227,10 +232,29 @@ async def process_one_lead_async(
     listing: dict = {"listed": None, "site": None, "kind": None, "detail": ""}
     tax_result: Optional[dict] = None
     if parsed.found:
-        # 2. Listing check (Zillow + Realtor, sale + rent).
-        listing = await _listing_check_one(browser, parsed.property_address)
-        # 3. Tax check.
-        tax_result = await _tax_check_one(browser, parsed, llm, playbooks)
+        # 2. Listing check (best-effort; Render is often captcha-blocked -> None).
+        try:
+            listing = await _listing_check_one(browser, parsed.property_address)
+        except Exception as e:  # noqa: BLE001
+            print(f"      [listing err] {e}")
+        # 3. Tax — baseline from the note (reliable for every county, never
+        #    crashes). The Researcher wrote Total Taxes Owed + How Much Paid.
+        tax_result = {
+            "current_due": None,   # engine falls back to parsed.total_owed (comprehensive)
+            "payment_recent_amount": parsed.paid_amount,
+            "tax_paid_last_12mo": parsed.tax_paid_last_12mo,
+            "error": None,
+        }
+        if USE_LIVE_TAX:           # optional live enrichment (off by default)
+            try:
+                live = await _tax_check_one(browser, parsed, llm, playbooks)
+                if live and not live.get("error"):
+                    if isinstance(live.get("current_balance"), (int, float)):
+                        tax_result["current_due"] = live["current_balance"]
+                    if live.get("payment_recent_amount"):
+                        tax_result["payment_recent_amount"] = live["payment_recent_amount"]
+            except Exception as e:  # noqa: BLE001
+                print(f"      [tax live err] {e}")
 
     # 4. Decide.
     decision = decide(parsed, listing, tax_result)
@@ -404,14 +428,17 @@ async def run_cleanup_async() -> dict:
         for lid, nm, reason in errors[:10]:
             print(f"  [{lid}] {nm}: {reason}")
 
-    # Post to Slack.
-    slack_client.post_summary(rows, stats)
-    if errors:
-        sample = errors[0]
-        slack_client.post_error(
-            f"{len(errors)} lead(s) errored during cleanup. "
-            f"First: [{sample[0]}] {sample[1]}: {sample[2]}"
-        )
+    # Post to Slack — but NOT on a dry run (so test runs don't hit the team).
+    if DRY_RUN:
+        print("[slack] DRY_RUN — skipping Slack post.")
+    else:
+        slack_client.post_summary(rows, stats)
+        if errors:
+            sample = errors[0]
+            slack_client.post_error(
+                f"{len(errors)} lead(s) errored during cleanup. "
+                f"First: [{sample[0]}] {sample[1]}: {sample[2]}"
+            )
 
     return stats
 
