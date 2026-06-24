@@ -47,10 +47,10 @@ services:
       # "Recent" tax payment window — Raul's rule keys off the last year.
       - key: TAX_LOOKBACK_DAYS
         value: "365"
-      # Decision thresholds (Raul's logic) — see .env.example. Code has
-      # sensible defaults; override here only to retune without a redeploy.
+      # Profit math (Raul's #1 filter) — see .env.example. Code has sensible
+      # defaults; override here only to retune without a redeploy.
       - key: MIN_NET_PROFIT
-        value: "50000"
+        value: "60000"
 
   - type: cron
     name: hvt-fatty-cleanup-cron

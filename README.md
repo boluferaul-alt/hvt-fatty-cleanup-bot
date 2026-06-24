@@ -41,7 +41,7 @@ same Lofty + Slack scaffolding).
 |---|---|---|
 | 1 | Listed on the market (VERIFIED active) | **DNC** — realtors block deep discounts |
 | 2 | Taxes fully paid / $0 due | **DNC** |
-| 3 | Est. net `< MIN_NET_PROFIT` (`0.8·value − owed − $8K heirs − $7K attorney − 6%`) | **DNC** (or **OCC_ALIVE** if deceased) |
+| 3 | **Profit math (#1 filter):** est. net `< $60K` where `net = value − owed − $8K heirs − $5K attorney − 6%·value`; value = lower of assessed/Zillow, or their average if far apart | **Flag — your call** (DNC, or OCC_ALIVE if deceased) |
 | 4 | Deceased owner + value ≥ `HVT_MIN_VALUE` + still owes | **HVT** (title/heir play) |
 | 5 | Active tax lawsuit + still owes | **STAY** (strong motivation) |
 | 6 | Estate / third-party payer + intent to pay | **VAULT** |

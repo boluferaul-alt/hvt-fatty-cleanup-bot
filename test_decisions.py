@@ -11,7 +11,8 @@ from types import SimpleNamespace
 from dataclasses import dataclass
 from typing import Optional
 
-from hvt_fatty_decision import decide, DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW
+from hvt_fatty_decision import (decide, DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW,
+                                _best_value, _est_net)
 
 
 def P(**kw):
@@ -98,7 +99,24 @@ def main() -> int:
         print(f"  [{'PASS' if ok else 'FAIL'}] {c.label}")
         print(f"         expected={c.expected}  got={d.category} ({d.confidence}) — {d.reason}")
         p, f = (p+1, f) if ok else (p, f+1)
-    print(f"\n  {p} passed, {f} failed of {len(CASES)}")
+    # --- profit-math unit checks ---
+    print("\n  Profit-math checks:")
+    checks = [
+        ("$100K value, $10K owed -> $71K net (Raul's example)",
+         round(_est_net(100000, 10000)) == 71000),
+        ("net < $60K target flags (87K val, 12K owed -> 56,780)",
+         _est_net(87000, 12000) < 60000),
+        ("value: far apart (100K vs 200K) -> average 150K",
+         _best_value(P(assessed_value=100000, zillow_zestimate=200000)) == 150000),
+        ("value: close (100K vs 110K) -> lower 100K",
+         _best_value(P(assessed_value=100000, zillow_zestimate=110000)) == 100000),
+        ("value: only assessed present -> that value",
+         _best_value(P(assessed_value=95000)) == 95000),
+    ]
+    for label, ok in checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
+        p, f = (p+1, f) if ok else (p, f+1)
+    print(f"\n  {p} passed, {f} failed of {len(CASES)+len(checks)}")
     return 0 if f == 0 else 1
 
 

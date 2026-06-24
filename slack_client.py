@@ -107,10 +107,16 @@ def build_summary_message(rows: list[dict], stats: dict) -> dict:
                      ("OCC-ALIVE", occ), ("STAY", stay), ("REVIEW", review)):
         if b:
             tally_parts.append(f"*{label}*: {len(b)}")
+    below = [r for r in rows if r.get("below_target")]
+    if below:
+        tally_parts.insert(0, f"*💸 BELOW NET TARGET*: {len(below)}")
     blocks.append({"type": "section",
                    "text": {"type": "mrkdwn", "text": " · ".join(tally_parts) or "no leads"}})
     blocks.append({"type": "divider"})
 
+    # The profit math is Raul's #1 filter — surface it first. These are his
+    # call to remove; the bot only flags them.
+    blocks += _section("💸 Below $60K net target — YOUR CALL to remove", below)
     blocks += _section("🚫 Do Not Contact — listed / paid up / no motivation", dnc)
     blocks += _section("🎯 HVT — deceased + value + taxes owed", hvt)
     blocks += _section("🗄️ Vault — intent to pay / park it", vault)

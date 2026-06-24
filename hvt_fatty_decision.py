@@ -52,11 +52,16 @@ STAY = "STAY"
 REVIEW = "REVIEW"
 
 # Tunable thresholds (env-overridable, no redeploy needed)
-SALE_FACTOR        = float(os.getenv("SALE_FACTOR", "0.80"))      # likely sale price vs assessed
-HEIR_COST          = float(os.getenv("HEIR_COST", "8000"))
-ATTORNEY_COST      = float(os.getenv("ATTORNEY_COST", "7000"))
-COMMISSION_PCT     = float(os.getenv("COMMISSION_PCT", "0.06"))
-MIN_NET_PROFIT     = float(os.getenv("MIN_NET_PROFIT", "50000"))  # Raul's floor
+# THE PROFIT MATH (Raul's #1 filter, given verbatim 2026-06-24):
+#   net = value - taxes_owed - HEIR_COST - ATTORNEY_COST - COMMISSION_PCT*value
+#   value = lower of (assessed, Zillow) normally; their AVERAGE if they differ a lot.
+#   net < MIN_NET_PROFIT  ->  FLAG for Raul's decision (never auto-removed).
+# Example: $100K value, $10K owed -> 100-10-8-5-6 = $71K net -> stays (>= $60K).
+HEIR_COST          = float(os.getenv("HEIR_COST", "8000"))    # avg paid to heirs per deal
+ATTORNEY_COST      = float(os.getenv("ATTORNEY_COST", "5000"))# avg attorney fees to close
+COMMISSION_PCT     = float(os.getenv("COMMISSION_PCT", "0.06"))# commissions + closing, on value
+MIN_NET_PROFIT     = float(os.getenv("MIN_NET_PROFIT", "60000"))  # target net; below = flag
+BIG_DISCREPANCY    = float(os.getenv("BIG_DISCREPANCY", "0.25"))  # |zillow-assessed|/max above this = "far apart"
 HVT_MIN_VALUE      = float(os.getenv("HVT_MIN_VALUE", "80000"))
 SUBSTANTIAL_PAYMENT= float(os.getenv("SUBSTANTIAL_PAYMENT", "1000"))
 DEAD_RATIO         = float(os.getenv("DEAD_RATIO", "0.02"))       # owed/value below this = no motivation
@@ -82,12 +87,18 @@ def _money(v: Optional[float]) -> str:
 
 
 def _best_value(parsed) -> Optional[float]:
-    for v in (getattr(parsed, "assessed_value", None),
-              getattr(parsed, "market_value", None),
-              getattr(parsed, "zillow_zestimate", None)):
-        if v and v > 0:
-            return float(v)
-    return None
+    """Value used in the profit math. Raul's rule: when assessed and Zillow
+    differ a lot, use their AVERAGE; otherwise use the LOWER (conservative)."""
+    assessed = getattr(parsed, "assessed_value", None)
+    zillow = getattr(parsed, "zillow_zestimate", None) or getattr(parsed, "market_value", None)
+    a = float(assessed) if assessed and assessed > 0 else None
+    z = float(zillow) if zillow and zillow > 0 else None
+    if a and z:
+        hi = max(a, z)
+        if hi and abs(a - z) / hi > BIG_DISCREPANCY:
+            return (a + z) / 2.0      # far apart -> average
+        return min(a, z)              # close -> lower of the two
+    return a or z
 
 
 def _is_deceased(parsed) -> bool:
@@ -102,10 +113,10 @@ def _is_vacant(parsed) -> bool:
 
 
 def _est_net(value: Optional[float], owed: float) -> Optional[float]:
+    """Raul's net: value - taxes owed - heirs - attorney - 6% of value."""
     if value is None:
         return None
-    sale = SALE_FACTOR * value
-    return sale - owed - HEIR_COST - ATTORNEY_COST - COMMISSION_PCT * sale
+    return value - owed - HEIR_COST - ATTORNEY_COST - COMMISSION_PCT * value
 
 
 def decide(
@@ -161,18 +172,21 @@ def decide(
     # 3. Profit-math gate — too thin after heirs/attorney/closing
     # ------------------------------------------------------------------
     if net is not None and net < MIN_NET_PROFIT:
+        math = (f"est. net {_money(net)} = {_money(value)} value − {_money(owed)} owed "
+                f"− {_money(HEIR_COST)} heirs − {_money(ATTORNEY_COST)} attorney − 6%")
         if deceased or vacant:
             return Decision(OCC_ALIVE,
-                f"Thin spread (est. net {_money(net)} < {_money(MIN_NET_PROFIT)}) but deceased/heir case — keep low-priority.",
-                "MED", "thin_margin")
+                f"⚠ BELOW {_money(MIN_NET_PROFIT)} NET ({math}) — but deceased/vacant; your call to remove.",
+                "MED", "below_target")
         return Decision(DNC,
-            f"Spread too thin — est. net {_money(net)} after heirs/attorney/6% (target {_money(MIN_NET_PROFIT)}).",
-            "MED", "thin_margin")
+            f"⚠ BELOW {_money(MIN_NET_PROFIT)} NET TARGET ({math}) — your call to remove.",
+            "MED", "below_target")
 
     # ------------------------------------------------------------------
     # 4. Deceased owner + value + still owes -> HVT (title/heir play)
     # ------------------------------------------------------------------
-    if deceased and value is not None and value >= HVT_MIN_VALUE and owed > 0:
+    if deceased and value is not None and value >= HVT_MIN_VALUE and owed > 0 \
+            and (vacant or (ratio is not None and ratio >= LOW_RATIO)):
         extra = " (taxes paid by a third party — likely title/heir issue)" if (paid and paid > 0) else ""
         vtag = "vacant " if vacant else ""
         return Decision(HVT,
@@ -248,13 +262,21 @@ def render_row(
     if not name and parsed is not None:
         name = getattr(parsed, "owner_name", "") or ""
     listing = listing or {}
+    # Profit math on every lead so the spreadsheet/Slack can show it.
+    value = _best_value(parsed) if parsed is not None else None
+    cd = (tax_result or {}).get("current_due")
+    owed_for_net = cd if isinstance(cd, (int, float)) else (
+        getattr(parsed, "total_owed", None) if parsed is not None else None)
+    net = _est_net(value, owed_for_net) if owed_for_net is not None else None
     return {
         "lead_id": (lead or {}).get("leadId") or (lead or {}).get("id"),
         "name": name,
         "address": getattr(parsed, "property_address", "") if parsed is not None else "",
         "county": getattr(parsed, "county", "") if parsed is not None else "",
         "owed": getattr(parsed, "total_owed", None) if parsed is not None else None,
-        "value": _best_value(parsed) if parsed is not None else None,
+        "value": value,
+        "net_profit_est": round(net) if net is not None else None,
+        "below_target": (net is not None and net < MIN_NET_PROFIT),
         "lawsuit": bool(getattr(parsed, "has_lawsuit", False)) if parsed is not None else False,
         "deceased": _is_deceased(parsed) if parsed is not None else False,
         "vacant": _is_vacant(parsed) if parsed is not None else False,
