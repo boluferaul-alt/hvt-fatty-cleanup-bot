@@ -32,106 +32,108 @@ def _truncate(s: str, n: int) -> str:
     return s[:n - 1] + "…"
 
 
+def _line(r: dict) -> str:
+    """One lead → one Slack line, tagged with its source pipeline."""
+    src = (r.get("source_pipeline") or "?").upper()
+    addr = _truncate(r.get("address") or "?", 36)
+    return (
+        f"`{src}` `{r['lead_id']}` {_truncate(r.get('name') or '?', 28)} — "
+        f"{addr} — {_money(r.get('value'))} — "
+        f"{_truncate(r.get('reason') or '', 120)}"
+    )
+
+
+def _section(title: str, rows: list[dict], cap: int = 20) -> list[dict]:
+    """Build a titled section + divider for a list of rows (empty → nothing)."""
+    if not rows:
+        return []
+    lines = [f"*{title}* ({len(rows)}):"]
+    for r in rows[:cap]:
+        lines.append(_line(r))
+    if len(rows) > cap:
+        lines.append(f"_…and {len(rows) - cap} more_")
+    return [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": "\n".join(lines)[:3000]}},
+        {"type": "divider"},
+    ]
+
+
 def build_summary_message(rows: list[dict], stats: dict) -> dict:
     """
-    Build a Slack message payload for the post-cleanup summary report.
+    Build the Slack payload for the cleanup report. Report-only: leads are
+    grouped by WHY they're flagged so Raul can pull the dead ones himself.
 
-    Format:
-      Header block — title + counts
-      Divider
-      Section per decision category — list of moves
-      Divider
-      Footer — run metadata
+      🏷️ Listed on the market   (Zillow/Realtor, sale or rent)
+      💵 Paid taxes recently     (≥ floor within the lookback window)
+      ⚠️ Needs manual review     (undetermined / scrape failed / no summary)
+      🟡 Partial payment (kept)  (heads-up, below floor — stays in pipeline)
+      ✅ Clean                    (count only)
 
-    Slack message limits:
-      - 50 blocks max → we cap per-category lists at 20 leads each, with
-        a "(+N more, see full log)" footer.
-      - 3000 char limit per text field → we truncate long reasons.
+    Slack limits: 50 blocks max (we cap each list at 20 rows), 3000 chars
+    per text field (we truncate).
     """
     when = stats.get("when") or ""
     pipeline_count = stats.get("pipeline_count")
     processed = stats.get("processed", len(rows))
+    auto_move = stats.get("auto_move")
 
+    mode = "report-only" if not auto_move else "auto-move"
     header = (
-        f"*HVT + Fatty cleanup — {when}*\n"
+        f"*HVT · Fatty · Hot Occ Alive cleanup — {when}*\n"
         f"Processed *{processed}* lead{'s' if processed != 1 else ''}"
     )
+    bits = []
     if pipeline_count is not None:
-        header += f" (HVT + Fatty currently has {pipeline_count})"
-    header += "."
+        bits.append(f"{pipeline_count} in the 3 pipelines")
+    bits.append(mode)
+    header += f" ({', '.join(bits)})."
 
     blocks: list[dict] = [
-        {"type": "section",
-         "text": {"type": "mrkdwn", "text": header}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
     ]
 
-    # Tally and group rows by decision category.
-    by_decision: dict[str, list[dict]] = {}
-    for r in rows:
-        by_decision.setdefault(r["decision"], []).append(r)
+    # Bucket rows by recommended destination.
+    def bucket(cat): return [r for r in rows if r.get("decision") == cat]
+    dnc   = bucket("DNC")
+    hvt   = bucket("HVT")
+    vault = bucket("VAULT")
+    occ   = bucket("OCC_ALIVE")
+    stay  = bucket("STAY")
+    review= bucket("REVIEW")
 
-    # Show tallies up front
-    tally_parts: list[str] = []
-    for cat in ("STAY", "VAULT", "FLAG"):
-        if cat in by_decision:
-            tally_parts.append(f"*{cat}*: {len(by_decision[cat])}")
-    if tally_parts:
-        blocks.append({"type": "section",
-                       "text": {"type": "mrkdwn",
-                                "text": " · ".join(tally_parts)}})
-
+    tally_parts = []
+    for label, b in (("DNC", dnc), ("HVT", hvt), ("VAULT", vault),
+                     ("OCC-ALIVE", occ), ("STAY", stay), ("REVIEW", review)):
+        if b:
+            tally_parts.append(f"*{label}*: {len(b)}")
+    blocks.append({"type": "section",
+                   "text": {"type": "mrkdwn", "text": " · ".join(tally_parts) or "no leads"}})
     blocks.append({"type": "divider"})
 
-    # Per-category lists (skip STAY — it's the boring majority)
-    for cat in ("VAULT", "FLAG"):
-        cat_rows = by_decision.get(cat) or []
-        if not cat_rows:
-            continue
-        lines: list[str] = [f"*{cat}* ({len(cat_rows)}):"]
-        for r in cat_rows[:20]:
-            move_tag = "✅" if "ok" in (r.get("move_result") or "").lower() else "⚠️"
-            addr = _truncate(r.get("address") or "?", 36)
-            line = (
-                f"{move_tag} `{r['lead_id']}` {_truncate(r['name'], 30)} — "
-                f"{addr} — {_money(r.get('value'))} — "
-                f"{_truncate(r['reason'], 120)}"
-            )
-            lines.append(line)
-        if len(cat_rows) > 20:
-            lines.append(f"_…and {len(cat_rows) - 20} more_")
-        blocks.append({"type": "section",
-                       "text": {"type": "mrkdwn",
-                                "text": "\n".join(lines)[:3000]}})
-        blocks.append({"type": "divider"})
-
-    # Move-failure summary
-    move_failed = [r for r in rows
-                   if r["decision"] == "VAULT"
-                   and "ok" not in (r.get("move_result") or "").lower()
-                   and "dry" not in (r.get("move_result") or "").lower()
-                   and "disabled" not in (r.get("move_result") or "").lower()]
-    if move_failed:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn",
-            "text": (f"⚠️ *{len(move_failed)} VAULT move(s) FAILED via API* — "
-                     f"Lofty API silently rejected the stage change. The "
-                     f"recommendations above are correct but the leads are "
-                     f"still in HVT/Fatty. Manual moves needed.")}})
+    blocks += _section("🚫 Do Not Contact — listed / paid up / no motivation", dnc)
+    blocks += _section("🎯 HVT — deceased + value + taxes owed", hvt)
+    blocks += _section("🗄️ Vault — intent to pay / park it", vault)
+    blocks += _section("🏠 Occupied-Alive — paying, low priority", occ)
+    blocks += _section("⚠️ Review — bot couldn't decide", review)
 
     # Footer
-    footer_bits = [f"_Run completed at {when}_"]
+    footer_bits = [f"_{len(stay)} still working (STAY)_"]
     if stats.get("duration_s"):
         footer_bits.append(f"_{stats['duration_s']:.0f}s elapsed_")
     if stats.get("dry_run"):
-        footer_bits.append("_DRY_RUN mode — no actual moves attempted_")
+        footer_bits.append("_DRY_RUN — nothing moved or posted live_")
+    elif not auto_move:
+        footer_bits.append("_report-only — no leads were moved_")
     blocks.append({"type": "context",
                    "elements": [{"type": "mrkdwn",
                                  "text": " · ".join(footer_bits)}]})
 
     return {
         "blocks": blocks,
-        # Fallback text for notifications and old Slack clients
-        "text": (f"HVT+Fatty cleanup — {processed} processed: "
-                 + " ".join(tally_parts)),
+        "text": (f"Cleanup — {processed} processed: "
+                 f"DNC {len(dnc)}, HVT {len(hvt)}, Vault {len(vault)}, "
+                 f"Occ {len(occ)}, Review {len(review)}"),
     }
 
 

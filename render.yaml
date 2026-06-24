@@ -31,16 +31,26 @@ services:
         value: "606230"
       - key: STAGE_FATTY
         value: "606229"
+      - key: STAGE_HOT_OCC_ALIVE
+        value: "648757"
       - key: STAGE_VAULT_HOT_OCC_ALIVE
         value: "428742"
+      - key: STAGE_DO_NOT_CONTACT
+        value: "425581"
       - key: DRY_RUN
         value: "0"
+      # Report-only: decide + post Slack, but never move a lead.
       - key: AUTO_MOVE
-        value: "1"
+        value: "0"
       - key: CLEANUP_LIMIT
         value: "0"
-      - key: PAYMENT_VAULT_THRESHOLD
-        value: "1000"
+      # "Recent" tax payment window — Raul's rule keys off the last year.
+      - key: TAX_LOOKBACK_DAYS
+        value: "365"
+      # Decision thresholds (Raul's logic) — see .env.example. Code has
+      # sensible defaults; override here only to retune without a redeploy.
+      - key: MIN_NET_PROFIT
+        value: "50000"
 
   - type: cron
     name: hvt-fatty-cleanup-cron
@@ -82,19 +92,34 @@ services:
           type: web
           name: hvt-fatty-cleanup-bot
           envVarKey: STAGE_FATTY
+      - key: STAGE_HOT_OCC_ALIVE
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: STAGE_HOT_OCC_ALIVE
       - key: STAGE_VAULT_HOT_OCC_ALIVE
         fromService:
           type: web
           name: hvt-fatty-cleanup-bot
           envVarKey: STAGE_VAULT_HOT_OCC_ALIVE
-      - key: PAYMENT_VAULT_THRESHOLD
+      - key: STAGE_DO_NOT_CONTACT
         fromService:
           type: web
           name: hvt-fatty-cleanup-bot
-          envVarKey: PAYMENT_VAULT_THRESHOLD
+          envVarKey: STAGE_DO_NOT_CONTACT
+      - key: TAX_LOOKBACK_DAYS
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: TAX_LOOKBACK_DAYS
+      - key: MIN_NET_PROFIT
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: MIN_NET_PROFIT
       - key: DRY_RUN
         value: "0"
       - key: AUTO_MOVE
-        value: "1"
+        value: "0"
       - key: CLEANUP_LIMIT
         value: "0"

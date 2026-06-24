@@ -1,52 +1,59 @@
-# HVT + Fatty Cleanup Bot
+# HVT / Fatty / Hot Occ Alive Cleanup Bot
 
-A scheduled + on-demand bot that audits the **HVT** and **Fatty** pipelines
-in Lofty CRM. For each lead, it reads the Researcher Bot Summary note,
-checks whether the property is currently listed on **Zillow**, scrapes
-the **county tax portal** to see if the owner has made a recent payment,
-and decides whether the lead should be **vaulted**, **flagged** for manual
-review, or left **as-is**.
+A scheduled + on-demand bot that audits the **HVT**, **Fatty**, and
+**Hot Occupied/Alive** pipelines in Lofty CRM. For each lead it reads the
+Researcher Bot Summary note (value, taxes owed, tax-lawsuit, deceased/alive,
+occupancy), checks whether the property is **actively listed** (Zillow +
+Realtor.com, for sale OR for rent), scrapes the **county tax portal** for the
+current balance + recent payments, and recommends one of **five
+destinations** based on how much *motivation* is left.
+
+**Decision model rebuilt 2026-06-24** from Raul's hand review of 467 leads —
+"taxes were paid" is NOT an automatic removal. See `hvt_fatty_decision.py`.
+
+**Report-only by default.** The bot recommends and posts a Slack report; Raul
+reviews and moves leads himself. (Set `AUTO_MOVE=1` to auto-route each
+recommendation to its stage.)
 
 Companion to **hot-occ-alive-cleanup-bot** (same Render deployment style,
-same Lofty + Slack scaffolding) and lifts the Zillow + tax-portal modules
-from **lofty-overdue-bot** (running daily in prod for weeks).
+same Lofty + Slack scaffolding).
 
 ---
 
 ## What it does per lead
 
-1. Pulls every lead currently in stageId `606230` (HVT) and `606229` (Fatty).
-2. Fetches each lead's notes via Lofty API.
-3. Picks the most recent Researcher Bot Summary note and parses out:
-   property address, county, owner, taxes owed, appraised value.
-4. Runs `zillow_check.is_listed_for_sale(address)` — Playwright-driven,
-   returns True / False / None (None = couldn't determine).
-5. Runs `tax_scraper` against the property's county portal — returns the
-   current balance, the amount paid in the last 12 months, and the date
-   of the last payment.
-6. Applies the decision tree (below) → VAULT / FLAG / STAY.
-7. If decision is VAULT, moves the lead via Lofty API to
-   `STAGE_VAULT_HOT_OCC_ALIVE` (428742) — same vault destination as the
-   existing hot-occ-alive cleanup bot.
-8. Posts a structured Slack summary with per-category sections to
-   `#dirtydeedbot`.
+1. Pulls every lead in `606230` (HVT), `606229` (Fatty), `648757` (Hot Occ Alive).
+2. Parses the Researcher Summary note: value, taxes owed, tax-lawsuit,
+   deceased/alive, occupancy, owner.
+3. `listing_check.check_listing` — Zillow + Realtor, **active** for-sale/for-rent
+   only (off-market / sold / pending are rejected).
+4. `tax_scraper` — county portal current balance + recent payments.
+5. `decide(...)` → **DNC / HVT / VAULT / OCC_ALIVE / STAY / REVIEW** (+ confidence).
+6. *(Only if `AUTO_MOVE=1`)* routes each recommendation to its stage
+   (DNC→425581, HVT→606230, VAULT→428742, OCC_ALIVE→648757). STAY/REVIEW never move.
+7. Posts a Slack report to `#dirtydeedbot` grouped by destination.
 
 ---
 
-## Decision tree
+## Decision model (Raul's logic — priority order)
 
-| Priority | Signal | Outcome |
+| # | Signal | Destination |
 |---|---|---|
-| 1 | Listed on Zillow (True) | **VAULT** — "Owner is selling on MLS" |
-| 2 | Tax payment in last 12 months ≥ $1,000 | **VAULT** — "Heat cooling: paid $X on YYYY-MM-DD" |
-| 3 | Tax payment in last 12 months > $0 but < $1,000 | **FLAG** — "Small payment $X, manual review" |
-| 4 | Zillow check returned None (couldn't determine) AND tax check OK | **FLAG** — "Zillow undetermined, manual review" |
-| 5 | Tax scrape failed entirely | **FLAG** — "Tax check failed for county Y" |
-| 6 | No Researcher Bot Summary note on lead | **FLAG** — "Missing bot summary, can't address-lookup" |
-| 7 | Everything OK, no listing, no payment | **STAY** — leave in HVT or Fatty |
+| 1 | Listed on the market (VERIFIED active) | **DNC** — realtors block deep discounts |
+| 2 | Taxes fully paid / $0 due | **DNC** |
+| 3 | Est. net `< MIN_NET_PROFIT` (`0.8·value − owed − $8K heirs − $7K attorney − 6%`) | **DNC** (or **OCC_ALIVE** if deceased) |
+| 4 | Deceased owner + value ≥ `HVT_MIN_VALUE` + still owes | **HVT** (title/heir play) |
+| 5 | Active tax lawsuit + still owes | **STAY** (strong motivation) |
+| 6 | Estate / third-party payer + intent to pay | **VAULT** |
+| 7 | Big recent payment + low owed/value ratio + alive | **DNC** · else **OCC_ALIVE** |
+| 8 | Owed/value ratio `< DEAD_RATIO` (~2%) → DNC; `< LOW_RATIO` (~4%) → OCC_ALIVE | **DNC / OCC_ALIVE** |
+| 9 | Small payments vs big balance owed | **STAY** |
+| 10 | Missing tax/value data | **REVIEW** |
 
-See `hvt_fatty_decision.py` for the code. The $1,000 threshold is exposed
-as `PAYMENT_VAULT_THRESHOLD` (env-overridable).
+All thresholds (`SALE_FACTOR`, `HEIR_COST`, `ATTORNEY_COST`, `COMMISSION_PCT`,
+`MIN_NET_PROFIT`, `HVT_MIN_VALUE`, `SUBSTANTIAL_PAYMENT`, `DEAD_RATIO`,
+`LOW_RATIO`) are env-overridable — retune without a redeploy. `test_decisions.py`
+encodes 15 of Raul's real leads as the regression spec.
 
 ---
 
@@ -83,7 +90,8 @@ All stage IDs are hardcoded in `render.yaml`:
 |---|---|
 | HVT (source) | 606230 |
 | Fatty (source) | 606229 |
-| Vault Hot Occ Alive (destination for VAULT) | 428742 |
+| Hot Occ Alive (source) | 648757 |
+| Vault Hot Occ Alive (destination if AUTO_MOVE=1) | 428742 |
 
 If Lofty re-numbers a stage, update the env var in Render's UI — no
 redeploy needed.
@@ -137,10 +145,12 @@ The cron job runs `python main.py` every Sunday at 23:00 UTC.
 | `ANTHROPIC_API_KEY` | optional | — | Used by tax_scraper for HTML interpretation. If empty, tax scrape returns FLAG ("LLM key missing"). |
 | `STAGE_HVT` | no | `606230` | HVT source pipeline. |
 | `STAGE_FATTY` | no | `606229` | Fatty source pipeline. |
-| `STAGE_VAULT_HOT_OCC_ALIVE` | no | `428742` | VAULT destination. |
-| `PAYMENT_VAULT_THRESHOLD` | no | `1000` | USD; ≥ this paid in last 12mo → VAULT. |
+| `STAGE_HOT_OCC_ALIVE` | no | `648757` | Hot Occ Alive source pipeline. |
+| `STAGE_VAULT_HOT_OCC_ALIVE` | no | `428742` | REMOVE destination (only used if `AUTO_MOVE=1`). |
+| `PAYMENT_FLAG_THRESHOLD` | no | `500` | USD; ≥ this paid within the window → REMOVE. |
+| `TAX_LOOKBACK_DAYS` | no | `90` | Days back that count as a "recent" payment. |
 | `DRY_RUN` | no | `0` | `1` = decide but don't move or post (still logs). |
-| `AUTO_MOVE` | no | `1` | `0` = decide + post Slack, but skip API moves. |
+| `AUTO_MOVE` | no | `0` | `0` = report-only (no moves). `1` = auto-vault REMOVE. |
 | `CLEANUP_LIMIT` | no | `0` | Max leads per run. `0` = all. |
 
 ---
@@ -179,7 +189,8 @@ DRY_RUN=1 CLEANUP_LIMIT=5 python main.py
 | `main.py` | Orchestrator — top-to-bottom cleanup run |
 | `lofty_client.py` | Lofty API client (auth, list leads, read notes, move) |
 | `note_parser.py` | Parses Researcher Bot Summary notes |
-| `zillow_check.py` | Playwright-driven MLS-listing check |
+| `listing_check.py` | Playwright listing check — Zillow + Realtor.com, sale + rent |
+| `zillow_check.py` | Legacy Zillow-only check (superseded by listing_check) |
 | `tax_scraper.py` | County-portal payment lookup |
 | `county_resolver.py` | Discovers tax-search URL per TX county |
 | `hvt_fatty_decision.py` | Decision tree (VAULT / FLAG / STAY) |

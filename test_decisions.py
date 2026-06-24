@@ -1,171 +1,105 @@
 """
-Regression tests for hvt_fatty_decision.decide().
-
-Each case feeds synthetic inputs (parsed summary + Zillow status + tax result)
-and asserts the expected category. Run:
+Regression tests for hvt_fatty_decision.decide() — built from Raul's hand
+review of real leads (2026-06-24). Each case encodes the lead's actual signals
+and asserts the bot now routes where Raul did.
 
     python test_decisions.py
-
-Exit code 0 if all pass, 1 if any fail.
 """
-
 from __future__ import annotations
-
 import sys
+from types import SimpleNamespace
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Optional
 
-from note_parser import parse_summary
-from hvt_fatty_decision import (
-    decide,
-    VAULT, FLAG, STAY,
-)
+from hvt_fatty_decision import decide, DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW
+
+
+def P(**kw):
+    base = dict(found=True, owner_name="", county="", property_address="",
+                total_owed=None, has_lawsuit=False, assessed_value=None,
+                market_value=None, zillow_zestimate=None, owner_status="alive",
+                deceased_confirmed=False, occupancy="", is_vacant=False,
+                is_vacant_land=False, is_entity=False)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+def L(listed=False, site=None, kind=None):
+    return {"listed": listed, "site": site, "kind": kind}
+
+def T(current_due=None, paid=0, date=None, payer="", err=None):
+    return {"current_due": current_due, "payment_recent_amount": paid,
+            "last_payment_date": date, "payer_name": payer, "error": err}
 
 
 @dataclass
 class Case:
-    label: str
-    expected: str
-    note: str                                # Researcher Bot Summary text (or "" for missing)
-    zillow_listed: Optional[bool]            # True/False/None
-    tax_result: Optional[dict]               # dict or None
+    label: str; expected: str
+    parsed: object; listing: dict; tax: dict
 
 
-# Sample note used across the "happy-path" cases. Big-value, dead-owner,
-# vacant — exactly the kind of lead that should be sitting in HVT/Fatty.
-SAMPLE_NOTE = """SUMMARY REPORT
-County: Brazoria
-Owner: GUERRERO CLOTILDE ESTATE
-Property: 309 AVENUE E 1/2, ALVIN
-Type: SFR
-Total Taxes Owed: $6,525.59
-Total Back Years Tax: 3
-Tax Lawsuit: NO
-County Assessed: $102,520
-Occupancy: VACANT
-Deceased
-"""
-
-
-CASES: list[Case] = [
-    Case(
-        label="Active Zillow listing → VAULT",
-        expected=VAULT,
-        note=SAMPLE_NOTE,
-        zillow_listed=True,
-        tax_result={
-            "current_balance": 6525.59,
-            "payment_last_12mo_amount": 0,
-            "last_payment_date": None,
-            "error": None,
-        },
-    ),
-    Case(
-        label="$2,400 paid in last 12mo → VAULT",
-        expected=VAULT,
-        note=SAMPLE_NOTE,
-        zillow_listed=False,
-        tax_result={
-            "current_balance": 4125.59,
-            "payment_last_12mo_amount": 2400.00,
-            "last_payment_date": "2026-02-15",
-            "error": None,
-        },
-    ),
-    Case(
-        label="$300 paid in last 12mo → FLAG (small payment)",
-        expected=FLAG,
-        note=SAMPLE_NOTE,
-        zillow_listed=False,
-        tax_result={
-            "current_balance": 6225.59,
-            "payment_last_12mo_amount": 300.00,
-            "last_payment_date": "2026-01-10",
-            "error": None,
-        },
-    ),
-    Case(
-        label="No listing + no payment → STAY",
-        expected=STAY,
-        note=SAMPLE_NOTE,
-        zillow_listed=False,
-        tax_result={
-            "current_balance": 6525.59,
-            "payment_last_12mo_amount": 0,
-            "last_payment_date": None,
-            "error": None,
-        },
-    ),
-    Case(
-        label="Zillow returned None + no payment → FLAG (undetermined)",
-        expected=FLAG,
-        note=SAMPLE_NOTE,
-        zillow_listed=None,
-        tax_result={
-            "current_balance": 6525.59,
-            "payment_last_12mo_amount": 0,
-            "last_payment_date": None,
-            "error": None,
-        },
-    ),
-    Case(
-        label="Missing summary note → FLAG",
-        expected=FLAG,
-        note="",                                # parse_summary returns found=False
-        zillow_listed=False,
-        tax_result={
-            "current_balance": None,
-            "payment_last_12mo_amount": 0,
-            "last_payment_date": None,
-            "error": None,
-        },
-    ),
-    Case(
-        label="Tax scrape failed → FLAG",
-        expected=FLAG,
-        note=SAMPLE_NOTE,
-        zillow_listed=False,
-        tax_result={
-            "current_balance": None,
-            "payment_last_12mo_amount": None,
-            "last_payment_date": None,
-            "error": "exception:TimeoutError:network",
-        },
-    ),
-    Case(
-        label="Tax scrape never ran (None) → FLAG",
-        expected=FLAG,
-        note=SAMPLE_NOTE,
-        zillow_listed=False,
-        tax_result=None,
-    ),
+CASES = [
+    Case("Psillas — listed for sale (verified)", DNC,
+         P(owner_name="PSILLAS NICHOLAS", assessed_value=120000, total_owed=4000),
+         L(True, "HAR", "sale"), T(current_due=4000)),
+    Case("Roman — taxes fully paid ($0 due)", DNC,
+         P(owner_name="ROMAN JOSE", assessed_value=110000, total_owed=3000),
+         L(False), T(current_due=0, paid=2917)),
+    Case("Anderson — owes $125K of $420K, tax lawsuit, tiny payments", STAY,
+         P(owner_name="ANDERSON JAMES", assessed_value=420000, total_owed=125000, has_lawsuit=True),
+         L(False), T(current_due=125000, paid=700)),
+    Case("Threadgill — deceased, vacant, $273K value, $10K owed", HVT,
+         P(owner_name="THREADGILL WILLIAM", assessed_value=273000, total_owed=10000,
+           deceased_confirmed=True, is_vacant=True),
+         L(False), T(current_due=10000)),
+    Case("Sanders — deceased, $175K value, $11K owed, lawsuit (heir occupied)", HVT,
+         P(owner_name="SANDERS GRACE", assessed_value=175000, total_owed=11000,
+           deceased_confirmed=True, has_lawsuit=True),
+         L(False), T(current_due=11000, paid=300)),
+    Case("Hilliard — $87K value, $12K owed -> thin margin", DNC,
+         P(owner_name="HILLIARD ODIS", assessed_value=87000, total_owed=12000),
+         L(False), T(current_due=12000)),
+    Case("White — deceased, $90K value, $3K owed -> thin but deceased", OCC_ALIVE,
+         P(owner_name="WHITE MARIE", assessed_value=90000, total_owed=3000, deceased_confirmed=True),
+         L(False), T(current_due=3000, paid=600)),
+    Case("Canterbury — $398K value, only $3,960 owed, alive", DNC,
+         P(owner_name="CANTERBURY EARNEST", assessed_value=398000, total_owed=3960),
+         L(False), T(current_due=3960, paid=500)),
+    Case("Mendez — $79K value, $6,600 owed -> thin margin", DNC,
+         P(owner_name="MENDEZ SYLVESTER", assessed_value=79000, total_owed=6600),
+         L(False), T(current_due=6600, paid=1114)),
+    Case("Rivera — $430K value, $6K owed, big recent payment, alive", DNC,
+         P(owner_name="RIVERA JOSE", assessed_value=430000, total_owed=6000),
+         L(False), T(current_due=6000, paid=3720)),
+    Case("Lino — $439K value, $18K owed, 3yr behind, alive/paying", OCC_ALIVE,
+         P(owner_name="LINO CLEOTILDE", assessed_value=439000, total_owed=18000),
+         L(False), T(current_due=18000, paid=5952)),
+    Case("Livingston — estate, $3K paid recently -> intent + oddity", VAULT,
+         P(owner_name="LIVINGSTON MARIAN E ESTATE", assessed_value=140000, total_owed=9000),
+         L(False), T(current_due=9000, paid=3000, payer="Dana Anderson")),
+    Case("Willie Doris Trust — owes ~$10K, only <$1K paid -> still motivated", STAY,
+         P(owner_name="WILLIE DORIS REV LD TRUST", assessed_value=110000, total_owed=10000),
+         L(False), T(current_due=10000, paid=565)),
+    Case("Hines — NOT listed (off-market), $45K owed of $400K, no payment", STAY,
+         P(owner_name="HINES MYRTLE", assessed_value=400000, total_owed=45000),
+         L(False), T(current_due=45000, paid=0)),
+    Case("Listing undetermined + still owes -> not auto-killed (STAY)", STAY,
+         P(owner_name="X", assessed_value=200000, total_owed=20000),
+         L(None), T(current_due=20000, paid=0)),
 ]
 
 
 def main() -> int:
-    # Force UTF-8 stdout so em-dashes / arrows in test labels don't
-    # crash on Windows cp1252.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-    passed = failed = 0
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
+    p = f = 0
     for c in CASES:
-        parsed = parse_summary(c.note) if c.note else parse_summary("")
-        d = decide(parsed, c.zillow_listed, c.tax_result)
+        d = decide(c.parsed, c.listing, c.tax)
         ok = d.category == c.expected
-        tag = "PASS" if ok else "FAIL"
-        print(f"  [{tag}] {c.label}")
-        print(f"         expected={c.expected}  got={d.category}")
-        if not ok:
-            print(f"         reason: {d.reason}")
-            failed += 1
-        else:
-            passed += 1
-    print()
-    print(f"  {passed} passed, {failed} failed (of {len(CASES)} total)")
-    return 0 if failed == 0 else 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] {c.label}")
+        print(f"         expected={c.expected}  got={d.category} ({d.confidence}) — {d.reason}")
+        p, f = (p+1, f) if ok else (p, f+1)
+    print(f"\n  {p} passed, {f} failed of {len(CASES)}")
+    return 0 if f == 0 else 1
 
 
 if __name__ == "__main__":

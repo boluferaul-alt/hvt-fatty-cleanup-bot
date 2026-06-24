@@ -27,7 +27,7 @@ import gc
 import os
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from playwright.async_api import async_playwright
@@ -36,9 +36,13 @@ from lofty_client import LoftyClient
 from note_parser import parse_lead_summary, ParsedSummary
 from hvt_fatty_decision import (
     decide, Decision, render_row,
-    VAULT, FLAG, STAY, NO_MOVE_DECISIONS,
+    DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW, NO_MOVE_DECISIONS,
 )
-import zillow_check
+
+# How far back a tax payment counts as "recent" when summing payments. Raul's
+# rule keys off "paid in the last year", so default to 365 days.
+TAX_LOOKBACK_DAYS = int(os.getenv("TAX_LOOKBACK_DAYS", "365"))
+import listing_check
 import tax_scraper
 from county_resolver import (
     discover_county_playbook, get_cached_playbook,
@@ -55,10 +59,23 @@ import slack_client
 
 STAGE_HVT = int(os.getenv("STAGE_HVT", "606230"))
 STAGE_FATTY = int(os.getenv("STAGE_FATTY", "606229"))
+STAGE_HOT_OCC_ALIVE = int(os.getenv("STAGE_HOT_OCC_ALIVE", "648757"))
 STAGE_VAULT_HOT_OCC_ALIVE = int(os.getenv("STAGE_VAULT_HOT_OCC_ALIVE", "428742"))
+STAGE_DO_NOT_CONTACT = int(os.getenv("STAGE_DO_NOT_CONTACT", "425581"))
+
+# Where each recommended destination moves to (only used when AUTO_MOVE=1).
+# STAY / REVIEW never move — they're judgment calls Raul finishes himself.
+DEST_STAGE = {
+    DNC: STAGE_DO_NOT_CONTACT,
+    HVT: STAGE_HVT,
+    VAULT: STAGE_VAULT_HOT_OCC_ALIVE,
+    OCC_ALIVE: STAGE_HOT_OCC_ALIVE,
+}
 
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
-AUTO_MOVE = os.getenv("AUTO_MOVE", "1") == "1"
+# Report-only by default: decide + post Slack, but never move a lead. Raul
+# reviews the report and moves the leads himself.
+AUTO_MOVE = os.getenv("AUTO_MOVE", "0") == "1"
 CLEANUP_LIMIT = int(os.getenv("CLEANUP_LIMIT", "0"))
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -74,14 +91,25 @@ def _llm_or_none() -> Optional[LLM]:
         return None
 
 
-async def _zillow_check_one(browser, address: str) -> Optional[bool]:
-    """Wrap zillow_check.is_listed_for_sale with safety net."""
+async def _listing_check_one(browser, address: str) -> dict:
+    """Wrap listing_check.check_listing (Zillow + Realtor) with a safety net."""
+    undetermined = {"listed": None, "site": None, "kind": None, "detail": ""}
     if not address:
+        return undetermined
+    try:
+        return await listing_check.check_listing(browser, address)
+    except Exception as e:  # noqa: BLE001
+        print(f"      [listing err] {e}")
+        return {**undetermined, "detail": f"error: {e}"}
+
+
+def _parse_date(s: Optional[str]):
+    """Parse a YYYY-MM-DD string to a date; None if unparseable."""
+    if not s:
         return None
     try:
-        return await zillow_check.is_listed_for_sale(browser, address)
-    except Exception as e:  # noqa: BLE001
-        print(f"      [zillow err] {e}")
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
         return None
 
 
@@ -91,12 +119,16 @@ async def _tax_check_one(
 ) -> dict:
     """Run the county tax scrape and shape the result into the dict
     that decide() expects:
-        current_balance, payment_last_12mo_amount, last_payment_date, error
+        current_balance, payment_recent_amount, payment_last_12mo_amount,
+        last_payment_date, recent_window_days, ambiguous_recent, error
     """
     result = {
         "current_balance": None,
+        "payment_recent_amount": None,
         "payment_last_12mo_amount": None,
         "last_payment_date": None,
+        "recent_window_days": TAX_LOOKBACK_DAYS,
+        "ambiguous_recent": False,
         "error": None,
     }
 
@@ -143,14 +175,37 @@ async def _tax_check_one(
 
     result["current_balance"] = record.total_due
     result["payment_last_12mo_amount"] = record.paid_last_12_months or 0
-    # Pick the most recent payment date from the payments list.
-    dates = [p.date for p in (record.payments or []) if p.date]
-    if dates:
-        try:
-            dates.sort(reverse=True)
-            result["last_payment_date"] = dates[0]
-        except Exception:  # noqa: BLE001
-            result["last_payment_date"] = dates[0] if dates else None
+
+    # Sum only the payments that fall inside the recent window (e.g. 90 days).
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=TAX_LOOKBACK_DAYS)
+    recent_sum = 0.0
+    recent_dates: list[str] = []
+    dated_payments = 0
+    for p in (record.payments or []):
+        d = _parse_date(p.date)
+        if d is None:
+            continue
+        dated_payments += 1
+        if d >= cutoff and isinstance(p.amount, (int, float)):
+            recent_sum += p.amount
+            recent_dates.append(p.date)
+
+    result["payment_recent_amount"] = recent_sum
+
+    # Most-recent payment date overall (prefer a dated recent one).
+    all_dates = sorted([p.date for p in (record.payments or []) if p.date],
+                       reverse=True)
+    if recent_dates:
+        result["last_payment_date"] = sorted(recent_dates, reverse=True)[0]
+    elif all_dates:
+        result["last_payment_date"] = all_dates[0]
+
+    # The county reported a 12-month payment but gave us no dated payment
+    # lines, so we can't confirm whether it landed inside the recent window.
+    # Flag it for manual review instead of silently treating it as old.
+    if recent_sum == 0 and dated_payments == 0 and (record.paid_last_12_months or 0) > 0:
+        result["ambiguous_recent"] = True
+
     return result
 
 
@@ -167,36 +222,37 @@ async def process_one_lead_async(
     notes = client.get_notes(lead_id)
     parsed = parse_lead_summary(notes)
 
-    # If we couldn't even find a bot summary, skip Zillow + tax — they
+    # If we couldn't even find a bot summary, skip listing + tax — they
     # need the property address / county.
-    zillow_listed: Optional[bool] = None
+    listing: dict = {"listed": None, "site": None, "kind": None, "detail": ""}
     tax_result: Optional[dict] = None
     if parsed.found:
-        # 2. Zillow check.
-        zillow_listed = await _zillow_check_one(browser, parsed.property_address)
+        # 2. Listing check (Zillow + Realtor, sale + rent).
+        listing = await _listing_check_one(browser, parsed.property_address)
         # 3. Tax check.
         tax_result = await _tax_check_one(browser, parsed, llm, playbooks)
 
     # 4. Decide.
-    decision = decide(parsed, zillow_listed, tax_result)
+    decision = decide(parsed, listing, tax_result)
 
-    # 5. Move (if VAULT and not DRY_RUN).
+    # 5. Move — route to the destination's stage (only if AUTO_MOVE on and not
+    # a dry run). Ships report-only by default. STAY/REVIEW never move.
     move_result = ""
-    if decision.category in NO_MOVE_DECISIONS:
+    target = DEST_STAGE.get(decision.category)
+    if decision.category in NO_MOVE_DECISIONS or target is None:
         move_result = decision.category.lower()
     elif DRY_RUN:
         move_result = "dry-run"
     elif not AUTO_MOVE:
-        move_result = "auto-move disabled"
+        move_result = "report-only"
     else:
-        # VAULT → stage = STAGE_VAULT_HOT_OCC_ALIVE
-        attempt = client.move_to_stage(lead_id, STAGE_VAULT_HOT_OCC_ALIVE)
+        attempt = client.move_to_stage(lead_id, target)
         move_result = "ok" if attempt.ok else f"FAIL ({attempt.status})"
 
     print(f"      → {decision.category}  ({move_result})  — {decision.reason}")
 
     return render_row(
-        lead, parsed, zillow_listed, tax_result, decision,
+        lead, parsed, listing, tax_result, decision,
         move_result, source_pipeline=source_pipeline,
     )
 
@@ -211,7 +267,9 @@ async def run_cleanup_async() -> dict:
     print(f"  DRY_RUN={int(DRY_RUN)}  AUTO_MOVE={int(AUTO_MOVE)}  "
           f"LIMIT={CLEANUP_LIMIT or 'all'}")
     print(f"  STAGE_HVT={STAGE_HVT}  STAGE_FATTY={STAGE_FATTY}  "
+          f"STAGE_HOT_OCC_ALIVE={STAGE_HOT_OCC_ALIVE}  "
           f"VAULT={STAGE_VAULT_HOT_OCC_ALIVE}")
+    print(f"  TAX_LOOKBACK_DAYS={TAX_LOOKBACK_DAYS}")
     print("=" * 72)
 
     client = LoftyClient()
@@ -225,16 +283,22 @@ async def run_cleanup_async() -> dict:
     # Lofty's /leads endpoint requires scanning the full workspace (~36K
     # leads) since the server-side stageId filter is ignored, so we
     # bucket both stages in one pass instead of two.
-    print(f"\nListing leads in stages {STAGE_HVT} (HVT) and {STAGE_FATTY} (Fatty) — single pass...")
-    buckets = client.list_leads_in_stages([STAGE_HVT, STAGE_FATTY])
+    print(f"\nListing leads in stages {STAGE_HVT} (HVT), {STAGE_FATTY} (Fatty), "
+          f"{STAGE_HOT_OCC_ALIVE} (Hot Occ Alive) — single pass...")
+    buckets = client.list_leads_in_stages(
+        [STAGE_HVT, STAGE_FATTY, STAGE_HOT_OCC_ALIVE]
+    )
     hvt_leads = buckets.get(STAGE_HVT, [])
     fatty_leads = buckets.get(STAGE_FATTY, [])
-    print(f"Found {len(hvt_leads)} HVT lead(s) and {len(fatty_leads)} Fatty lead(s).")
+    hot_leads = buckets.get(STAGE_HOT_OCC_ALIVE, [])
+    print(f"Found {len(hvt_leads)} HVT, {len(fatty_leads)} Fatty, "
+          f"{len(hot_leads)} Hot Occ Alive lead(s).")
 
     # Tag each lead with its source pipeline for the report.
     tagged: list[tuple[str, dict]] = (
         [("HVT", ld) for ld in hvt_leads]
         + [("FATTY", ld) for ld in fatty_leads]
+        + [("HOT", ld) for ld in hot_leads]
     )
     pipeline_count = len(tagged)
     print(f"\nTotal to process: {pipeline_count} lead(s).")
@@ -321,6 +385,7 @@ async def run_cleanup_async() -> dict:
         "pipeline_count": pipeline_count,
         "hvt_count": len(hvt_leads),
         "fatty_count": len(fatty_leads),
+        "hot_count": len(hot_leads),
         "duration_s": elapsed,
         "tally": tally,
         "errors": len(errors),
@@ -331,9 +396,9 @@ async def run_cleanup_async() -> dict:
     print("\n" + "=" * 72)
     print("Run summary")
     print("=" * 72)
-    for cat in (VAULT, FLAG, STAY):
+    for cat in (DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW):
         if cat in tally:
-            print(f"  {cat:10s} {tally[cat]}")
+            print(f"  {cat:12s} {tally[cat]}")
     if errors:
         print(f"\nErrors ({len(errors)}):")
         for lid, nm, reason in errors[:10]:
