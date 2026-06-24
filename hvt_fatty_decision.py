@@ -62,6 +62,7 @@ ATTORNEY_COST      = float(os.getenv("ATTORNEY_COST", "5000"))# avg attorney fee
 COMMISSION_PCT     = float(os.getenv("COMMISSION_PCT", "0.06"))# commissions + closing, on value
 MIN_NET_PROFIT     = float(os.getenv("MIN_NET_PROFIT", "60000"))  # target net; below = flag
 BIG_DISCREPANCY    = float(os.getenv("BIG_DISCREPANCY", "0.25"))  # |zillow-assessed|/max above this = "far apart"
+MIN_PLAUSIBLE_VALUE= float(os.getenv("MIN_PLAUSIBLE_VALUE", "25000"))  # below this a parsed value is almost certainly a misread
 HVT_MIN_VALUE      = float(os.getenv("HVT_MIN_VALUE", "80000"))
 SUBSTANTIAL_PAYMENT= float(os.getenv("SUBSTANTIAL_PAYMENT", "1000"))
 DEAD_RATIO         = float(os.getenv("DEAD_RATIO", "0.02"))       # owed/value below this = no motivation
@@ -132,8 +133,21 @@ def decide(
     value = _best_value(parsed) if parsed is not None else None
     owed_note = getattr(parsed, "total_owed", None) if parsed is not None else None
     current_due = tax_result.get("current_due")
-    owed = current_due if isinstance(current_due, (int, float)) else owed_note
     paid = tax_result.get("payment_recent_amount")
+    paid_amt = paid if isinstance(paid, (int, float)) else 0
+    # Authoritative amount owed. A scraped $0 balance on ONE parcel does NOT mean
+    # "paid in full" for a multi-property owner — only treat it as paid off when a
+    # recent payment actually covered the Researcher's total. Otherwise the
+    # Researcher's "Total Taxes Owed" (all parcels) is the real number.
+    if isinstance(current_due, (int, float)) and current_due > 0:
+        owed = current_due
+    elif isinstance(current_due, (int, float)):           # scraped balance is 0/<=0
+        if isinstance(owed_note, (int, float)) and owed_note > 0 and paid_amt < 0.8 * owed_note:
+            owed = owed_note                              # multi-property: still owes elsewhere
+        else:
+            owed = 0                                      # genuinely paid off
+    else:
+        owed = owed_note                                  # no scrape -> Researcher total
     lawsuit = bool(getattr(parsed, "has_lawsuit", False)) if parsed is not None else False
     deceased = _is_deceased(parsed) if parsed is not None else False
     vacant = _is_vacant(parsed) if parsed is not None else False
@@ -169,15 +183,27 @@ def decide(
         return Decision(REVIEW, "Couldn't read taxes owed — verify manually.", "LOW")
 
     # ------------------------------------------------------------------
-    # 3. Profit-math gate — too thin after heirs/attorney/closing
+    # Value sanity — a misread value (e.g. $300K parsed as $30K) wrecks the
+    # profit math and produces absurd negative nets. Flag, don't auto-decide.
+    # ------------------------------------------------------------------
+    if value is None:
+        return Decision(REVIEW, "No usable value in the note — can't run the profit math; verify value.", "LOW", "bad_value")
+    if value < MIN_PLAUSIBLE_VALUE:
+        return Decision(REVIEW,
+            f"Value {_money(value)} is implausibly low — almost certainly a misread (e.g. $300K read as $30K); verify the note.",
+            "LOW", "bad_value")
+    if value < owed:
+        return Decision(REVIEW,
+            f"Value {_money(value)} is below taxes owed {_money(owed)} — likely a misread value; verify.",
+            "LOW", "bad_value")
+
+    # ------------------------------------------------------------------
+    # 3. Profit-math gate — below $60K net = DNC (Raul 2026-06-24: thin deals
+    #    are DNC even if deceased/vacant; the math wins).
     # ------------------------------------------------------------------
     if net is not None and net < MIN_NET_PROFIT:
         math = (f"est. net {_money(net)} = {_money(value)} value − {_money(owed)} owed "
                 f"− {_money(HEIR_COST)} heirs − {_money(ATTORNEY_COST)} attorney − 6%")
-        if deceased or vacant:
-            return Decision(OCC_ALIVE,
-                f"⚠ BELOW {_money(MIN_NET_PROFIT)} NET ({math}) — but deceased/vacant; your call to remove.",
-                "MED", "below_target")
         return Decision(DNC,
             f"⚠ BELOW {_money(MIN_NET_PROFIT)} NET TARGET ({math}) — your call to remove.",
             "MED", "below_target")

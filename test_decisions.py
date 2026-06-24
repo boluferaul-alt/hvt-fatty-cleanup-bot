@@ -86,6 +86,24 @@ CASES = [
     Case("Listing undetermined + still owes -> not auto-killed (STAY)", STAY,
          P(owner_name="X", assessed_value=200000, total_owed=20000),
          L(None), T(current_due=20000, paid=0)),
+    # ---- 2026-06-24 feedback: three fixes ----
+    Case("Below $60K net + deceased + VACANT -> DNC (math wins, not Occ-Alive)", DNC,
+         P(owner_name="THIN DECEASED", assessed_value=70000, total_owed=5000,
+           deceased_confirmed=True, is_vacant=True),
+         L(False), T(current_due=5000)),
+    Case("Multi-property: $0 on one parcel but Researcher total $8K, no big payment -> still owes (HVT)", HVT,
+         P(owner_name="MULTIPROP DECEASED", assessed_value=200000, total_owed=8000,
+           deceased_confirmed=True, is_vacant=True),
+         L(False), T(current_due=0, paid=0)),
+    Case("Genuinely paid off: $0 due + payment covered the total -> DNC (paid)", DNC,
+         P(owner_name="ROMAN PAID", assessed_value=110000, total_owed=3000),
+         L(False), T(current_due=0, paid=2917)),
+    Case("Misread value ($30K) below taxes owed ($45K) -> REVIEW (bad value)", REVIEW,
+         P(owner_name="BADVALUE", assessed_value=30000, total_owed=45000),
+         L(False), T(current_due=45000)),
+    Case("Finkelstein — value misread as $11,784 (implausibly low) -> REVIEW", REVIEW,
+         P(owner_name="FINKELSTEIN", assessed_value=11784, total_owed=9715),
+         L(False), T(current_due=9715)),
 ]
 
 
