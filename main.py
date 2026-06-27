@@ -82,6 +82,14 @@ CLEANUP_LIMIT = int(os.getenv("CLEANUP_LIMIT", "0"))
 # (reCAPTCHA portals, selector drift) — only enable it once per-county handlers
 # are solid.
 USE_LIVE_TAX = os.getenv("USE_LIVE_TAX", "0") == "1"
+# The per-lead Zillow + Realtor listing check launches a headless browser per
+# lead. From Render's cloud IP both portals captcha-block every request, so the
+# check returns "undetermined" (None) — zero decision signal — while costing
+# ~10-15s/lead. On a full 1500+ lead sweep that's hours and would never finish
+# inside the cron window. So it's OFF by default: decisions come off the
+# Researcher note (which already records listing/value/tax). Flip USE_LISTING=1
+# only from a non-blocked IP (e.g. a residential-proxy run).
+USE_LISTING = os.getenv("USE_LISTING", "0") == "1"
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
@@ -232,11 +240,14 @@ async def process_one_lead_async(
     listing: dict = {"listed": None, "site": None, "kind": None, "detail": ""}
     tax_result: Optional[dict] = None
     if parsed.found:
-        # 2. Listing check (best-effort; Render is often captcha-blocked -> None).
-        try:
-            listing = await _listing_check_one(browser, parsed.property_address)
-        except Exception as e:  # noqa: BLE001
-            print(f"      [listing err] {e}")
+        # 2. Listing check (best-effort; Render is captcha-blocked -> None, so
+        #    OFF by default — see USE_LISTING. The Researcher note already
+        #    carries listing status, which the decision engine reads.)
+        if USE_LISTING:
+            try:
+                listing = await _listing_check_one(browser, parsed.property_address)
+            except Exception as e:  # noqa: BLE001
+                print(f"      [listing err] {e}")
         # 3. Tax — baseline from the note (reliable for every county, never
         #    crashes). The Researcher wrote Total Taxes Owed + How Much Paid.
         tax_result = {
@@ -360,12 +371,20 @@ async def run_cleanup_async() -> dict:
         "--no-zygote",
     ]
 
+    # Only the listing check and the (optional) live tax scraper need a browser.
+    # With both off — the default fast path — we skip Playwright entirely, which
+    # turns an hours-long 1500+ lead sweep into a few minutes and removes all OOM
+    # risk. Decisions then come purely off the Researcher note data.
+    needs_browser = USE_LISTING or USE_LIVE_TAX
+    print(f"  needs_browser={int(needs_browser)} "
+          f"(USE_LISTING={int(USE_LISTING)}, USE_LIVE_TAX={int(USE_LIVE_TAX)})")
+
     async with async_playwright() as pw:
         browser = None
         try:
             for i, (source, lead) in enumerate(tagged, start=1):
-                # Restart browser at start of run + every N leads.
-                if browser is None or (i - 1) % BROWSER_REFRESH_EVERY == 0:
+                # Restart browser at start of run + every N leads (only if needed).
+                if needs_browser and (browser is None or (i - 1) % BROWSER_REFRESH_EVERY == 0):
                     if browser is not None:
                         try:
                             await browser.close()

@@ -44,6 +44,10 @@ services:
         value: "0"
       - key: CLEANUP_LIMIT
         value: "0"
+      # Per-lead Zillow/Realtor browser check. OFF: captcha-blocked from Render
+      # (no signal) and turns a full sweep into hours. Decisions read the note.
+      - key: USE_LISTING
+        value: "0"
       # "Recent" tax payment window — Raul's rule keys off the last year.
       - key: TAX_LOOKBACK_DAYS
         value: "365"
@@ -122,4 +126,6 @@ services:
       - key: AUTO_MOVE
         value: "0"
       - key: CLEANUP_LIMIT
+        value: "0"
+      - key: USE_LISTING
         value: "0"
