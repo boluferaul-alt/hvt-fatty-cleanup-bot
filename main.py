@@ -50,6 +50,7 @@ from county_resolver import (
 )
 from llm import LLM
 import slack_client
+import completion_contract as cc
 
 
 # ----------------------------------------------------------------------
@@ -82,6 +83,26 @@ CLEANUP_LIMIT = int(os.getenv("CLEANUP_LIMIT", "0"))
 # (reCAPTCHA portals, selector drift) — only enable it once per-county handlers
 # are solid.
 USE_LIVE_TAX = os.getenv("USE_LIVE_TAX", "0") == "1"
+
+# ---- COMPLETION CONTRACT ---------------------------------------------------
+# A lead is only DECIDABLE once its taxes are verified LIVE on the county tax
+# site. No live verification -> BLOCKED, never a recommendation. This is the
+# fix for the bot shortcutting to the (stale) researcher note. Turn off only to
+# fall back to the old note-based behaviour (REQUIRE_LIVE_TAX=0).
+REQUIRE_LIVE_TAX = os.getenv("REQUIRE_LIVE_TAX", "1") == "1"
+# Counties whose tax sites sit behind reCAPTCHA — a headless Render browser
+# cannot pass them. We BLOCK these honestly (with the reason) instead of
+# silently falling back to the note. They need the Edge-profile runner or a
+# human. Override: CAPTCHA_COUNTIES="BELL,TAYLOR,CALDWELL".
+CAPTCHA_COUNTIES = {
+    c.strip().upper() for c in
+    os.getenv("CAPTCHA_COUNTIES", "BELL,TAYLOR,CALDWELL").split(",") if c.strip()
+}
+TAX_ARTIFACT = cc.ArtifactSpec(
+    key="tax", label="live county tax check",
+    fields=("current_due",), source="tax_source_url", verified="tax_verified_at",
+)
+CONTRACT_SPECS = [TAX_ARTIFACT]
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
@@ -134,6 +155,8 @@ async def _tax_check_one(
         "last_payment_date": None,
         "recent_window_days": TAX_LOOKBACK_DAYS,
         "ambiguous_recent": False,
+        "source_url": None,      # the live county page we actually read (contract proof)
+        "verified_at": None,     # when we read it (contract proof)
         "error": None,
     }
 
@@ -178,6 +201,9 @@ async def _tax_check_one(
         result["error"] = record.error
         return result
 
+    # We actually reached + read the live county page — stamp the proof.
+    result["source_url"] = playbook.get("search_url")
+    result["verified_at"] = datetime.now(timezone.utc).isoformat()
     result["current_balance"] = record.total_due
     result["payment_last_12mo_amount"] = record.paid_last_12_months or 0
 
@@ -227,58 +253,100 @@ async def process_one_lead_async(
     notes = client.get_notes(lead_id)
     parsed = parse_lead_summary(notes)
 
-    # If we couldn't even find a bot summary, skip listing + tax — they
-    # need the property address / county.
     listing: dict = {"listed": None, "site": None, "kind": None, "detail": ""}
     tax_result: Optional[dict] = None
-    if parsed.found:
+    blocked_reason: Optional[str] = None
+
+    if not parsed.found:
+        # No researcher summary -> we can't even locate the property/county.
+        blocked_reason = ("no Researcher Summary on the lead — can't locate "
+                          "property/county to verify taxes")
+    else:
         # 2. Listing check (best-effort; Render is often captcha-blocked -> None).
         try:
             listing = await _listing_check_one(browser, parsed.property_address)
         except Exception as e:  # noqa: BLE001
             print(f"      [listing err] {e}")
-        # 3. Tax — baseline from the note (reliable for every county, never
-        #    crashes). The Researcher wrote Total Taxes Owed + How Much Paid.
-        tax_result = {
-            "current_due": None,   # engine falls back to parsed.total_owed (comprehensive)
-            "payment_recent_amount": parsed.paid_amount,
-            "tax_paid_last_12mo": parsed.tax_paid_last_12mo,
-            "error": None,
-        }
-        if USE_LIVE_TAX:           # optional live enrichment (off by default)
-            try:
-                live = await _tax_check_one(browser, parsed, llm, playbooks)
-                if live and not live.get("error"):
-                    if isinstance(live.get("current_balance"), (int, float)):
-                        tax_result["current_due"] = live["current_balance"]
-                    if live.get("payment_recent_amount"):
-                        tax_result["payment_recent_amount"] = live["payment_recent_amount"]
-            except Exception as e:  # noqa: BLE001
-                print(f"      [tax live err] {e}")
 
-    # 4. Decide.
-    decision = decide(parsed, listing, tax_result)
+        # 3. Tax — MUST be verified live on the county site (the whole point).
+        if REQUIRE_LIVE_TAX:
+            county_key = (parsed.county or "").strip().upper().replace(" COUNTY", "").strip()
+            if not parsed.county:
+                blocked_reason = "live county tax check: no county on the lead"
+            elif not parsed.owner_name:
+                blocked_reason = "live county tax check: no owner name to search"
+            elif county_key in CAPTCHA_COUNTIES:
+                blocked_reason = (f"live county tax check: {county_key.title()} County uses "
+                                  f"reCAPTCHA — headless can't verify; needs the Edge-profile "
+                                  f"runner or a human")
+            else:
+                try:
+                    live = await _tax_check_one(browser, parsed, llm, playbooks)
+                except Exception as e:  # noqa: BLE001
+                    live = {"error": f"exception:{e}"}
+                if (live.get("error") or live.get("current_balance") is None
+                        or not live.get("verified_at")):
+                    blocked_reason = (f"live county tax check failed: "
+                                      f"{live.get('error') or 'no balance read from the live page'}")
+                else:
+                    tax_result = {
+                        "current_due": live["current_balance"],
+                        "payment_recent_amount": live.get("payment_recent_amount"),
+                        "last_payment_date": live.get("last_payment_date"),
+                        "tax_source_url": live.get("source_url"),     # contract proof
+                        "tax_verified_at": live.get("verified_at"),   # contract proof
+                        # note value kept only as unverified context, never decided on:
+                        "note_tax_paid_last_12mo": parsed.tax_paid_last_12mo,
+                        "error": None,
+                    }
+        else:
+            # Legacy note-based path — only when the gate is explicitly disabled.
+            tax_result = {
+                "current_due": None,
+                "payment_recent_amount": parsed.paid_amount,
+                "tax_paid_last_12mo": parsed.tax_paid_last_12mo,
+                "tax_source_url": "note (unverified)",
+                "tax_verified_at": "note (unverified)",
+                "error": None,
+            }
 
-    # 5. Move — route to the destination's stage (only if AUTO_MOVE on and not
-    # a dry run). Ships report-only by default. STAY/REVIEW never move.
-    move_result = ""
-    target = DEST_STAGE.get(decision.category)
-    if decision.category in NO_MOVE_DECISIONS or target is None:
-        move_result = decision.category.lower()
-    elif DRY_RUN:
-        move_result = "dry-run"
-    elif not AUTO_MOVE:
-        move_result = "report-only"
+    # 4. GATE — a recommendation requires live-verified taxes. The decision step
+    #    physically refuses to run on an unverified record.
+    if blocked_reason is None and tax_result is not None:
+        try:
+            cc.assert_decidable(tax_result, CONTRACT_SPECS)
+        except cc.BlockedError as be:
+            blocked_reason = str(be)
+
+    if blocked_reason is not None:
+        decision = Decision(cc.BLOCKED, blocked_reason, confidence="—", flag_type="not_verified")
+        move_result = "blocked"
+        status = cc.BLOCKED
     else:
-        attempt = client.move_to_stage(lead_id, target)
-        move_result = "ok" if attempt.ok else f"FAIL ({attempt.status})"
+        decision = decide(parsed, listing, tax_result)
+        status = cc.VERIFIED
+        # 5. Move — route to the destination's stage (only if AUTO_MOVE on and
+        #    not a dry run). Ships report-only by default. STAY/REVIEW never move.
+        target = DEST_STAGE.get(decision.category)
+        if decision.category in NO_MOVE_DECISIONS or target is None:
+            move_result = decision.category.lower()
+        elif DRY_RUN:
+            move_result = "dry-run"
+        elif not AUTO_MOVE:
+            move_result = "report-only"
+        else:
+            attempt = client.move_to_stage(lead_id, target)
+            move_result = "ok" if attempt.ok else f"FAIL ({attempt.status})"
 
     print(f"      → {decision.category}  ({move_result})  — {decision.reason}")
 
-    return render_row(
+    row = render_row(
         lead, parsed, listing, tax_result, decision,
         move_result, source_pipeline=source_pipeline,
     )
+    row["status"] = status
+    row["blocked_reason"] = blocked_reason or ""
+    return row
 
 
 async def run_cleanup_async() -> dict:
@@ -403,6 +471,10 @@ async def run_cleanup_async() -> dict:
     for r in rows:
         tally[r["decision"]] = tally.get(r["decision"], 0) + 1
 
+    # Honest completion audit — verified-live vs BLOCKED. Partial work can never
+    # read as complete in the report.
+    completion = cc.audit(rows)
+
     stats = {
         "when": started_iso,
         "processed": len(rows),
@@ -415,12 +487,19 @@ async def run_cleanup_async() -> dict:
         "errors": len(errors),
         "dry_run": DRY_RUN,
         "auto_move": AUTO_MOVE,
+        "require_live_tax": REQUIRE_LIVE_TAX,
+        "audit": completion,
     }
 
     print("\n" + "=" * 72)
     print("Run summary")
     print("=" * 72)
-    for cat in (DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW):
+    print(f"  COMPLETION: {cc.audit_line(completion)}")
+    if completion["blocked"]:
+        for reason, n in completion["blocked_reasons"].items():
+            print(f"    BLOCKED x{n}: {reason}")
+    print("  " + "-" * 40)
+    for cat in (DNC, HVT, VAULT, OCC_ALIVE, STAY, REVIEW, cc.BLOCKED):
         if cat in tally:
             print(f"  {cat:12s} {tally[cat]}")
     if errors:

@@ -93,6 +93,16 @@ def build_summary_message(rows: list[dict], stats: dict) -> dict:
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
     ]
 
+    # Honest completion line — verified-live vs BLOCKED. Surfaced before anything
+    # else so a partial run can never read as complete.
+    a = stats.get("audit") or {}
+    if a:
+        comp = (f"✅ *{a.get('verified', 0)}* verified live  ·  "
+                f"⛔ *{a.get('blocked', 0)}* BLOCKED (not verified live)")
+        if not stats.get("require_live_tax", True):
+            comp += "  ·  _⚠ live-tax gate OFF (note-based)_"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": comp}})
+
     # Bucket rows by recommended destination.
     def bucket(cat): return [r for r in rows if r.get("decision") == cat]
     dnc   = bucket("DNC")
@@ -101,6 +111,7 @@ def build_summary_message(rows: list[dict], stats: dict) -> dict:
     occ   = bucket("OCC_ALIVE")
     stay  = bucket("STAY")
     review= bucket("REVIEW")
+    blocked = bucket("BLOCKED")
 
     tally_parts = []
     for label, b in (("DNC", dnc), ("HVT", hvt), ("VAULT", vault),
@@ -110,12 +121,16 @@ def build_summary_message(rows: list[dict], stats: dict) -> dict:
     below = [r for r in rows if r.get("below_target")]
     if below:
         tally_parts.insert(0, f"*💸 BELOW NET TARGET*: {len(below)}")
+    if blocked:
+        tally_parts.insert(0, f"*⛔ BLOCKED*: {len(blocked)}")
     blocks.append({"type": "section",
                    "text": {"type": "mrkdwn", "text": " · ".join(tally_parts) or "no leads"}})
     blocks.append({"type": "divider"})
 
-    # The profit math is Raul's #1 filter — surface it first. These are his
-    # call to remove; the bot only flags them.
+    # BLOCKED first — these are NOT done. They got no recommendation because the
+    # live county tax check couldn't be completed; each needs Edge/human.
+    blocks += _section("⛔ BLOCKED — not verified live, NO recommendation", blocked)
+    # The profit math is Raul's #1 filter — surface it next. His call to remove.
     blocks += _section("💸 Below $60K net target — YOUR CALL to remove", below)
     blocks += _section("🚫 Do Not Contact — listed / paid up / no motivation", dnc)
     blocks += _section("🎯 HVT — deceased + value + taxes owed", hvt)

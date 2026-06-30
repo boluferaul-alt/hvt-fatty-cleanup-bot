@@ -51,6 +51,16 @@ services:
       # defaults; override here only to retune without a redeploy.
       - key: MIN_NET_PROFIT
         value: "60000"
+      # --- Completion contract: a lead is only decided once its taxes are
+      # verified LIVE on the county site. No live check -> BLOCKED, never
+      # decided off the stale researcher note. Set "0" only to fall back to the
+      # old note-based behaviour. See COMPLETION_CONTRACT.md.
+      - key: REQUIRE_LIVE_TAX
+        value: "1"
+      # reCAPTCHA counties a headless Render browser can't pass -> blocked
+      # honestly (reason names the county) instead of guessed from the note.
+      - key: CAPTCHA_COUNTIES
+        value: "BELL,TAYLOR,CALDWELL"
 
   - type: cron
     name: hvt-fatty-cleanup-cron
@@ -117,6 +127,16 @@ services:
           type: web
           name: hvt-fatty-cleanup-bot
           envVarKey: MIN_NET_PROFIT
+      - key: REQUIRE_LIVE_TAX
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: REQUIRE_LIVE_TAX
+      - key: CAPTCHA_COUNTIES
+        fromService:
+          type: web
+          name: hvt-fatty-cleanup-bot
+          envVarKey: CAPTCHA_COUNTIES
       - key: DRY_RUN
         value: "0"
       - key: AUTO_MOVE
