@@ -148,7 +148,13 @@ def taylor_newest(max_days: int = 21) -> bool:
     from datetime import date, timedelta
     ref = "https://taylor-cad.org/data-downloads/"
     d = date.today()
+    # 9/19 on Render the WAF 429'd every probe and this walk ate 37 minutes
+    # before the tax check could start. Cap it; a stale roll beats a late run.
+    deadline = time.time() + 6 * 60
     for _ in range(max_days):
+        if time.time() > deadline:
+            print(f"  {'TAYLOR':18} gave up after 6 min of rate-limits")
+            return False
         fn = f"TaylorCAD_CollData_Delinquent_{d.strftime('%d%b%y')}.zip"
         if os.path.exists(os.path.join(DEST, fn)):
             print(f"  {'TAYLOR':18} already have newest {fn}")

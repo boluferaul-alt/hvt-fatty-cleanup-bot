@@ -872,17 +872,40 @@ class PropertyTaxPaymentsAdapter:
     _ROW_RE = re.compile(r"(?s)<tr[^>]*>(.*?)</tr>")
     _CELL_RE = re.compile(r"(?s)<t[dh][^>]*>(.*?)</t[dh]>")
 
+    last_fault = ""   # why the portal didn't give us a results page, if it didn't
+
     def _query(self, field: str, text: str) -> list[dict]:
-        try:
-            r = self.s.get(f"{self.base}/Search/Results",
-                           params={"Query.SearchField": field,
-                                   "Query.SearchText": text,
-                                   "Query.IncludeInactiveAccounts": "False",
-                                   "Query.PayStatus": "Both"}, timeout=30)
-            time.sleep(REQUEST_DELAY_SEC)
-        except requests.RequestException:
+        # 9/19 Render run: every Liberty lead came back "no account" while the
+        # same accounts verified from the laptop. A refused request used to look
+        # exactly like an empty result, so retry and remember what went wrong.
+        r = None
+        if getattr(self, "_refusals", 0) >= 4:
+            # Portal has refused us repeatedly this run (e.g. it blocks the
+            # server's IP). Fail fast with the same reason instead of spending
+            # ~30s of retries on every remaining lead.
             return []
-        if r.status_code != 200:
+        self.last_fault = ""
+        for wait in (0, 5, 20):
+            time.sleep(wait)
+            try:
+                r = self.s.get(f"{self.base}/Search/Results",
+                               params={"Query.SearchField": field,
+                                       "Query.SearchText": text,
+                                       "Query.IncludeInactiveAccounts": "False",
+                                       "Query.PayStatus": "Both"}, timeout=30)
+                time.sleep(REQUEST_DELAY_SEC)
+            except requests.RequestException as e:
+                self.last_fault = f"portal unreachable ({type(e).__name__})"
+                r = None
+                continue
+            if r.status_code == 200 and "Search Results" in r.text:  # real portal page, even with 0 hits
+                self.last_fault = ""
+                self._refusals = 0
+                break
+            self.last_fault = (f"portal refused the request (HTTP {r.status_code}"
+                               f"{', challenge page' if 'Just a moment' in r.text else ''})")
+        if r is None or self.last_fault:
+            self._refusals = getattr(self, "_refusals", 0) + 1
             return []
         tb = re.search(r"(?s)<tbody.*?</tbody>", r.text)
         if not tb:
@@ -903,10 +926,23 @@ class PropertyTaxPaymentsAdapter:
     def find_account(self, *, owner: str = "", address: str = "") -> list[dict]:
         if owner:
             key = re.sub(r"[',]", "", owner.upper()).strip()
-            hits = self._query("2", key)
-            if not hits and " " in key:      # retry on surname alone
-                hits = self._query("2", key.split()[0])
-            return hits
+            words = re.sub(r"[^A-Z0-9 ]", " ", key).split()
+            # The portal wants "LAST FIRST". Notes often say "FIRST LAST", which
+            # comes back as ~100 fuzzy matches and blocks the lead as ambiguous
+            # (Leon Almanza, Brazoria, 9/19). Try both orders and keep only
+            # owners carrying every word of the name.
+            orders = [key] + ([" ".join([words[-1]] + words[:-1])] if len(words) > 1 else [])
+            loose = []
+            for q in orders:
+                hits = self._query("2", q)
+                exact = [h for h in hits
+                         if set(words) <= set(re.sub(r"[^A-Z0-9 ]", " ", h["owner"].upper()).split())]
+                if exact:
+                    return exact
+                loose = loose or hits
+            if not loose and len(words) > 1:  # retry on surname alone
+                loose = self._query("2", words[0])
+            return loose
         if address:
             m = re.match(r"\s*(\d+\s+[A-Za-z0-9]+)", address)
             if m:
@@ -921,7 +957,8 @@ class PropertyTaxPaymentsAdapter:
         hits = self._query("1", str(account))
         row = next((h for h in hits if h["account"] == str(account)), None)
         if row is None:
-            st.error = f"no account {account} on the county portal"
+            st.error = (f"{self.last_fault} looking up account {account}" if self.last_fault
+                        else f"no account {account} on the county portal")
             return st
         if row["_total_due"] is None:
             st.error = f"could not read 'Total Due' for account {account}"
