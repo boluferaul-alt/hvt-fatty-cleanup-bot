@@ -366,6 +366,15 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
                                          [parsed.owner_name, getattr(parsed, "lead_name", "")])
                 if len(by_name) == 1:
                     narrowed = by_name
+            if 2 <= len(narrowed) <= 4 and len({_addr_key(h.get("site_address", ""))
+                                                 for h in narrowed}) == 1:
+                # Several tax accounts at the SAME street address (land + mobile
+                # home, lot + improvement): that's one property billed in
+                # pieces. Check every account and report the combined balance,
+                # listing each account so nothing is hidden.
+                combo = _combine_accounts(adapter, [h["account"] for h in narrowed])
+                if combo is not None:
+                    return combo, combo.account, f"portal_search_{field_name}_multi", ""
             if len(narrowed) != 1:
                 # Don't give up on an ambiguous owner search - the address
                 # search further down the plan often pins the one parcel.
@@ -383,6 +392,26 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
     reason = (f"live county check failed: {last_err}" if last_err
               else "no account found on the county portal")
     return None, "", "", reason
+
+
+def _combine_accounts(adapter, accounts: list[str]):
+    """Live-check every account; None unless ALL verify (never a partial sum)."""
+    import copy
+    sts = []
+    for acct in dict.fromkeys(accounts):
+        st = adapter.lookup(acct)
+        if not st.verified:
+            return None
+        sts.append(st)
+    combo = copy.copy(sts[0])
+    combo.total_due = round(sum(s.total_due or 0.0 for s in sts), 2)
+    combo.payments = [p for s in sts for p in s.payments]
+    combo.payments_available = all(s.payments_available for s in sts)
+    combo.account = "+".join(s.account for s in sts)
+    parts = "; ".join(f"acct {s.account} ${(s.total_due or 0):,.2f}" for s in sts)
+    combo.source_name = (f"{getattr(sts[0], 'source_name', 'County Tax Office')} "
+                         f"({len(sts)} tax accounts at this address: {parts})")
+    return combo
 
 
 def _clean_owner(owner: str) -> str:
