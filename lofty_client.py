@@ -20,7 +20,9 @@ without git-submodule shenanigans, and the surface area is tiny.
 
 from __future__ import annotations
 
+import html
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -65,14 +67,35 @@ class LoftyClient:
     # ------------------------------------------------------------------
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """One API call, with retries.
+
+        Listing a pipeline means walking the whole ~35K-lead workspace (350+
+        calls), and Lofty intermittently resets the connection partway through
+        — that killed an unattended tax_watch run on 2026-07-19 with
+        ConnectionResetError(10054). For a bot that must complete on its own,
+        a transient reset has to be survivable, so connection errors and 5xx
+        get an exponential backoff instead of taking the whole run down.
+        """
         url = f"{BASE_URL}{path}"
         kwargs.setdefault("headers", self.headers)
         kwargs.setdefault("timeout", 30)
-        resp = requests.request(method, url, **kwargs)
-        if resp.status_code == 429:
-            # Single 60s retry on rate limit.
-            time.sleep(60)
-            resp = requests.request(method, url, **kwargs)
+        last_exc = None
+        for attempt in range(5):
+            try:
+                resp = requests.request(method, url, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+                time.sleep(min(2 ** attempt, 30))   # 1,2,4,8,16s
+                continue
+            if resp.status_code == 429:
+                time.sleep(60)
+                continue
+            if resp.status_code >= 500:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            return resp
+        if last_exc is not None:
+            raise last_exc
         return resp
 
     @staticmethod
@@ -128,6 +151,7 @@ class LoftyClient:
             limit = 100
         targets = set(stage_ids)
         out: dict[int, list[dict]] = {sid: [] for sid in stage_ids}
+        seen_ids: set = set()
         page = 0
         empty_streak = 0
         while page < max_pages:
@@ -146,7 +170,14 @@ class LoftyClient:
                 page += 1
                 continue
             empty_streak = 0
-            for ld in batch:
+            # Past the end, Lofty keeps re-serving the last full page instead of
+            # returning a short/empty one (9/12/26 run looped the same 22 Harris
+            # leads ~100x). A page with no unseen lead ids means we're done.
+            new = [ld for ld in batch if ld.get("leadId") not in seen_ids]
+            if not new:
+                break
+            for ld in new:
+                seen_ids.add(ld.get("leadId"))
                 sid = ld.get("stageId")
                 if sid in targets:
                     out[sid].append(ld)
@@ -284,11 +315,18 @@ class LoftyClient:
     # Write operations
     # ------------------------------------------------------------------
 
-    def post_note(self, lead_id: int, content: str) -> bool:
+    def post_note(self, lead_id: int, content: str, pin: bool = False) -> bool:
         """
         Post a note to a lead. Returns True on success. Tries the flat
         /notes endpoint first (the one that works on the existing bot's
         API key); falls back to /leads/{id}/notes.
+
+        pin=True: after creating, flip the note's isPin flag so it sticks to
+        the TOP of the lead's timeline (Raul 2026-07-21 — "if you post notes
+        you must pin to top so we can see it as the first thing"). Lofty has no
+        create-with-pin, so we create, locate the note we just wrote by exact
+        content match, and PUT its isPin. A note that posts but fails to pin
+        still returns True (the content is what matters) but logs the miss.
         """
         endpoints = [
             ("POST", "/notes", {"leadId": lead_id, "content": content}),
@@ -304,8 +342,81 @@ class LoftyClient:
                     data = body.get("data")
                     if isinstance(data, str) and data.lower() == "no change":
                         continue
+                if pin:
+                    # Pin the id the POST handed back when it's usable, but
+                    # ALWAYS fall through to the content lookup if that fails.
+                    # These used to be either/or, so one bad id meant no pin at
+                    # all — 24 of 28 notes on the 2026-07-26 run posted unpinned.
+                    note_id = self._note_id_from_post(body)
+                    ok = bool(note_id) and self.set_note_pin(lead_id, note_id, content, True)
+                    if not ok:
+                        ok = self.pin_latest_note(lead_id, content)
+                    if not ok:
+                        print(f"      [pin] posted but could NOT pin note on {lead_id}")
                 return True
         return False
+
+    @staticmethod
+    def _note_id_from_post(body) -> Optional[int]:
+        """The SHORT noteId from a create-note response, or None.
+
+        A Lofty note carries TWO ids: a short `noteId` (187568253) and a long
+        snowflake `id` (1241334726691762176). Only the short one addresses
+        PUT /notes/{id}; the snowflake returns 404 "Resource not exist". The old
+        one-liner here had an `or`/conditional precedence bug that let the
+        snowflake through, so the pin PUT 404'd and the note stayed unpinned.
+        Take `noteId` and nothing else — never fall back to `id`.
+        """
+        nodes = [body]
+        if isinstance(body, dict):
+            nodes.append(body.get("data"))
+        for node in nodes:
+            if isinstance(node, dict) and node.get("noteId"):
+                return node["noteId"]
+        return None
+
+    def pin_latest_note(self, lead_id: int, content: str, tries: int = 4) -> bool:
+        """Pin the note on `lead_id` whose content matches `content`.
+
+        Right after a POST, Lofty may not have indexed the new note yet, so a
+        single get_notes can miss it — that raced 23/68 notes into a false
+        "could not pin" on the 2026-07-21 full run. So we retry the lookup a
+        few times with a short backoff before giving up.
+
+        Lofty stores note text HTML-escaped, so a note reading "SMITH JOHN &
+        ETAL" comes back as "&amp; ETAL". Comparing that against the raw
+        `content` we posted never matched, so every note carrying an ampersand
+        fell through to a false "could NOT pin" — 3 of 30 on the 2026-08-15
+        run (HOBBS, BRYANT, MATTHEWS, all with "&" in the payer/owner name).
+        Unescape both sides before comparing.
+        """
+        want = html.unescape(re.sub(r"\s+", " ", content.strip()))
+        for attempt in range(tries):
+            for n in self.get_notes(lead_id):
+                stripped = html.unescape(
+                    re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(n.get("content") or "")).strip()))
+                if stripped == want or want in stripped:
+                    note_id = n.get("noteId") or n.get("id")
+                    if str(n.get("isPin")) == "True":
+                        return True
+                    return self.set_note_pin(lead_id, note_id, content, True)
+            time.sleep(1 + attempt)   # 1,2,3s — let the note index
+        return False
+
+    def set_note_pin(self, lead_id: int, note_id, content: str, pinned: bool) -> bool:
+        """Flip a note's pin flag. PUT /notes/{noteId} is the endpoint that
+        the API key can write (the /leads/.../notes and /pin variants 404).
+
+        The PUT returning 2xx is authoritative — a follow-up read can lag
+        behind indexing and wrongly report isPin=False (that false negative is
+        what logged 23 bogus 'could not pin' lines even though the pins stuck).
+        So trust the write status; do a best-effort confirm but don't fail on
+        a stale read.
+        """
+        resp = self._request("PUT", f"/notes/{note_id}",
+                             json={"isPin": bool(pinned), "content": content,
+                                   "leadId": lead_id})
+        return resp.status_code in (200, 201, 204)
 
     def move_to_stage(self, lead_id: int, stage_id: int) -> MoveAttempt:
         """

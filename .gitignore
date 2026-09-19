@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 .env
 .venv/
+
+# Local run state. Render rebuilds it each run; only the learned account
+# cache and the last Bell/Taylor rolls (fallback when their WAF 429s) ship.
+state/*
+!state/account_cache.json
+!state/bulk/
+state/bulk/*
+!state/bulk/BellCAD_*.xlsx
+!state/bulk/TaylorCAD_*.zip
