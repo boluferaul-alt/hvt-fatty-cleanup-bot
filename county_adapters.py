@@ -595,6 +595,11 @@ class CaldwellCADAdapter:
 
     def __init__(self, county: str = "CALDWELL", slug=None, session: Optional[requests.Session] = None):
         self.county = county
+        # Other counties run the same eSearch software, and their property page
+        # carries the same tax table (Taylor) or at least the real situs address
+        # (Fort Bend). Pass the site as `slug` to point this adapter at one.
+        if slug:
+            self.BASE = str(slug).rstrip("/")
         self.s = session or requests.Session()
         self.s.headers.update({"User-Agent": UA,
                                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -1169,3 +1174,57 @@ def get_adapter(county: str, session: Optional[requests.Session] = None):
 
 def supported_counties() -> list[str]:
     return sorted(ACT_COUNTIES)
+
+
+# --- appraisal-district (eSearch) fallback --------------------------------
+# Counties whose CAD runs the same eSearch software as Caldwell. Used when the
+# tax portal can't be resolved from the note: the CAD page is keyed by the
+# note's own "Property Id", and it gives the SITUS ADDRESS (and for some
+# counties the live tax table) — Raul 9/22: "when there's no account number you
+# can search it by name, by property address, or by property ID."
+ESEARCH_CAD = {
+    "CALDWELL":  "https://esearch.caldwellcad.org",
+    "TAYLOR":    "https://esearch.taylor-cad.org",
+    "FORT BEND": "https://esearch.fbcad.org",
+}
+
+
+def cad_adapter(county: str, session: Optional[requests.Session] = None):
+    """A CAD-backed adapter for `county`, or None. Its lookup() takes the CAD
+    prop_id and returns a balance when that CAD publishes a tax table."""
+    base = ESEARCH_CAD.get(canonical_county(county))
+    return CaldwellCADAdapter(canonical_county(county), base, session=session) if base else None
+
+
+def cad_situs(county: str, prop_id: str,
+              session: Optional[requests.Session] = None) -> dict:
+    """{'address','owner'} from the CAD property page, or {} — the note's
+    Property Id is often the CAD id, and Lofty's address can be the owner's
+    MAILING address (Davis Gail: Lofty said 661 Bering Dr Houston, the parcel
+    is Evans Rd in Rosenberg)."""
+    base = ESEARCH_CAD.get(canonical_county(county))
+    pid = str(prop_id or "").strip()
+    if not base or not pid:
+        return {}
+    s = session or requests.Session()
+    out = {}
+    for cand in dict.fromkeys([pid, re.sub(r"^[A-Za-z]+", "", pid)]):
+        if not cand:
+            continue
+        try:
+            r = s.get(f"{base}/Property/View/{cand}",
+                      headers={"User-Agent": UA}, timeout=30)
+            time.sleep(REQUEST_DELAY_SEC)
+        except requests.RequestException:
+            continue
+        if r.status_code != 200:
+            continue
+        text = _clean(r.text)
+        ma = re.search(r"Situs Address:\s*(.*?)\s+(?:Map ID|Mapsco|Legal)", text)
+        mo = re.search(r"Name:\s*(.*?)\s+(?:Agent|Mailing)", text)
+        if ma and ma.group(1).strip():
+            out = {"address": ma.group(1).strip()[:120],
+                   "owner": (mo.group(1).strip()[:120] if mo else ""),
+                   "account": cand}
+            break
+    return out

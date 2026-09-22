@@ -46,7 +46,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from county_adapters import get_adapter, supported_counties, canonical_county, UNSUPPORTED
+from county_adapters import (get_adapter, supported_counties, canonical_county,
+                             UNSUPPORTED, ESEARCH_CAD, cad_adapter, cad_situs)
 import bulk_rolls  # noqa: F401  — registers Bell/Taylor bulk-roll adapters
 import cameron_live  # noqa: F401  — registers the live Cameron adapter
 from lofty_client import LoftyClient
@@ -366,8 +367,9 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
                                          [parsed.owner_name, getattr(parsed, "lead_name", "")])
                 if len(by_name) == 1:
                     narrowed = by_name
-            if 2 <= len(narrowed) <= 4 and len({_addr_key(h.get("site_address", ""))
-                                                 for h in narrowed}) == 1:
+            same_place = len({_addr_key(h.get("site_address", ""))
+                              for h in narrowed}) == 1
+            if 2 <= len(narrowed) <= 4 and same_place:
                 # Several tax accounts at the SAME street address (land + mobile
                 # home, lot + improvement): that's one property billed in
                 # pieces. Check every account and report the combined balance,
@@ -386,6 +388,49 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
         r = _try(hits[0]["account"], f"portal_search_{field_name}")
         if r:
             return r
+
+    # 4. Appraisal-district fallback, keyed by the note's Property Id.
+    #    The CAD knows the real SITUS address (Lofty's can be the owner's
+    #    mailing address) and some CADs publish the tax table outright.
+    #    Raul 9/22: no account number is not a dead end — name, property
+    #    address and property ID are all ways in.
+    county = canonical_county(getattr(adapter, "county", "") or "")
+    pid = (parsed.property_id or "").strip()
+    if pid and county in ESEARCH_CAD:
+        situs = cad_situs(county, pid)
+        if situs.get("address"):
+            # Street-only, because the tax portal's address search wants
+            # "661 EVANS" or "EVANS", not "Evans RD, Rosenberg, TX 77471".
+            street = re.sub(r",.*$", "", situs["address"]).strip()
+            # Try every way in and keep whichever pins ONE parcel — a street
+            # search that returns 63 hits must not stop us from trying the
+            # CAD's owner name (Gail Davis, Fort Bend).
+            for kwargs in ({"address": street},
+                           {"owner": _clean_owner(situs.get("owner", ""))},
+                           {"owner": _clean_owner(parsed.owner_name)}):
+                if not list(kwargs.values())[0]:
+                    continue
+                try:
+                    hits = adapter.find_account(**kwargs)
+                except Exception:
+                    hits = []
+                if not hits:
+                    continue
+                narrowed = _match_by_address(hits, situs["address"])
+                if len(narrowed) != 1:
+                    by_name = _match_by_name(narrowed or hits,
+                                             [situs.get("owner", ""), parsed.owner_name])
+                    if len(by_name) == 1:
+                        narrowed = by_name
+                if len(narrowed) == 1:
+                    r = _try(narrowed[0]["account"], "cad_situs_then_portal")
+                    if r:
+                        return r
+        cad = cad_adapter(county)
+        if cad is not None:
+            st = cad.lookup(situs.get("account") or pid)
+            if st.verified:
+                return st, st.account, "cad_tax_table", ""
 
     if ambiguous:
         return None, "", "portal_search", ambiguous
@@ -424,7 +469,12 @@ def _clean_owner(owner: str) -> str:
     """
     s = re.sub(r"[,]", " ", (owner or "").upper())
     s = re.split(r"\b(?:ESTATE|EST|C/O|ETAL|ET AL|ETUX|ET UX|ET VIR|LIFE EST|"
-                 r"LF EST|TRUST|TR|HEIRS?|DECEASED|DEC'?D|&|JR|SR|III|II)\b", s)[0]
+                 r"LF EST|TRUST|TR|HEIRS?|DECEASED|DEC'?D|JR|SR|III|II)\b", s)[0]
+    # Ector notes append the tax attorneys to the owner ("FIELDS MARSHALL/
+    # MICHELE GREENE-ROY BELL ATTYS"); everything past the slash is not the
+    # owner. And "&" has no word boundary, so the pattern above never cut it —
+    # "COX SADIE & COX MICHAEL" went to the portal whole and found nothing.
+    s = s.split("/")[0].split("&")[0]
     s = re.sub(r"\s+", " ", s).strip()
     toks = s.split()
     return " ".join(toks[:3])
@@ -463,14 +513,53 @@ def _norm_addr(a: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[.,#]", " ", (a or "").upper())).strip()
 
 
+_ADDR_NOISE = {"TX", "TEXAS", "N", "S", "E", "W", "NE", "NW", "SE", "SW",
+               "ST", "STREET", "DR", "DRIVE", "RD", "ROAD", "LN", "LANE",
+               "AVE", "AVENUE", "BLVD", "CT", "COURT", "CIR", "CIRCLE",
+               "WAY", "PL", "PLACE", "TRL", "TRAIL", "PKWY", "HWY"}
+
+
+def _street_core(addr: str) -> set:
+    """The distinguishing words of a street address.
+
+    Drops the house number, ZIP, state and the street-type/direction words, so
+    "0 W LITTLE YORK RD HOUSTON TX 77088" and the county's "W LITTLE YORK RD
+    77088" both reduce to {LITTLE, YORK}.
+    """
+    s = _norm_addr(addr)
+    s = re.sub(r"^\d+\s+", "", s)                 # house number (incl. "0")
+    s = re.sub(r"\b\d{5}(?:-\d{4})?\b", " ", s)   # ZIP
+    return {t for t in s.split() if t not in _ADDR_NOISE and not t.isdigit()}
+
+
 def _match_by_address(hits: list[dict], property_address: str) -> list[dict]:
     want = _addr_key(property_address)
     if want:
-        return [h for h in hits if _addr_key(h.get("site_address", "")) == want]
-    # No house number (rural land: "COUNTY ROAD 661 OFF") - exact match only.
-    exact = _norm_addr(property_address)
-    if not exact:
+        exact = [h for h in hits if _addr_key(h.get("site_address", "")) == want]
+        if exact or want[0] != "0":
+            return exact
+        # House number "0" is the note's placeholder for vacant land; the
+        # county lists the same parcel with no number at all ("0 SPRING TOWN
+        # DR" vs "SPRING TOWN DR 77388"), which blocked 6 Harris leads on
+        # 9/19. Fall through to street-name matching.
+    # No usable house number (vacant land, rural: "COUNTY ROAD 661 OFF").
+    # Keep hits whose street words are all present in the note's address.
+    core = _street_core(property_address)
+    if not core:
         return []
+    out = [h for h in hits
+           if _street_core(h.get("site_address", "")) and
+           _street_core(h.get("site_address", "")) <= core]
+    if len(out) > 1:
+        # The note has no real house number (vacant land), so prefer the
+        # parcels the county also lists without one: "EVANS RD" is Gail Davis's
+        # vacant tract, "1007 EVANS RD" is somebody's house on the same street.
+        bare = [h for h in out if not _addr_key(h.get("site_address", ""))]
+        if bare:
+            return bare
+    if out:
+        return out
+    exact = _norm_addr(property_address)
     return [h for h in hits if _norm_addr(h.get("site_address", "")) == exact]
 
 
@@ -533,8 +622,27 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
 
     status, account, how, reason = resolve_and_lookup(adapter, parsed, cache, lead_id)
     if status is None or not status.verified:
-        row["reason"] = reason
-        return row
+        # The note's county can simply be wrong — Gerald Harris's note said
+        # Liberty, but 701 Pauline Rd, Cleveland is in SAN JACINTO, where the
+        # parcel was waiting under his own name (9/19). When the stated county
+        # has nothing, ask the geocoder where the address really is and try
+        # that county once before blocking.
+        addr_line = (parsed.property_address or "")
+        if not addr_line:
+            _, addr_line = lead_property_address(lead, client)
+        alt = canonical_county(county_for_address(addr_line) or "") if addr_line else ""
+        alt_adapter = get_adapter(alt) if alt and alt != row["county"] else None
+        if alt_adapter is not None:
+            alt_parsed = parsed
+            alt_parsed.county = alt
+            status, account, how, reason = resolve_and_lookup(
+                alt_adapter, alt_parsed, cache, lead_id)
+            if status is not None and status.verified:
+                row["county"], adapter = alt, alt_adapter
+                how = f"{how}_in_{alt.lower()}_not_noted_county"
+        if status is None or not status.verified:
+            row["reason"] = reason
+            return row
 
     cache[str(lead_id)] = account          # learned/confirmed
     row["account"], row["how_found"] = account, how
@@ -557,24 +665,13 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
         # acquisitions sees live tax state on every lead. But restating it
         # every run would bury the lead in identical notes, so only restate
         # once per `restate_days`. A NEW payment ignores this and posts now.
-        age = last_tax_note_age_days(notes)
-        if age is not None and age < restate_days:
-            # Don't add a duplicate note, but don't go silent either: rewrite
-            # the existing one with today's balance and date so the lead always
-            # shows when it was last verified. See refresh_in_place().
-            note = build_note(status, fresh, today_str)
-            row["note"] = note
-            row["status"] = VERIFIED_NOPAY
-            if dry_run:
-                row["reason"] = (f"DRY RUN - would refresh note in place "
-                                 f"(stated {age}d ago)")
-                return row
-            if refresh_in_place(client, lead_id, notes, note):
-                row["reason"] = f"note refreshed in place (was {age}d old)"
-            else:
-                row["reason"] = (f"already stated {age}d ago; in-place refresh "
-                                 f"FAILED - check pin/note ids")
-            return row
+        #
+        # Raul 2026-09-22, overriding both of the above: post a NEW dated note
+        # EVERY run, even when nothing changed. Refreshing the old note in
+        # place kept Lofty's original timestamp, so the lead showed "Aug 8"
+        # beside a note whose text said 9/19 — and "if we don't see an update,
+        # we have to go and manually check, and that defeats the purpose."
+        # A fresh note per run is the receipt that the check happened.
         row["status"] = VERIFIED_UNPAID
 
     note = build_note(status, fresh, today_str)
