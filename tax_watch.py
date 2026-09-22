@@ -682,6 +682,15 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
         row["reason"] = "DRY RUN - note not posted"
         return row
 
+    # One note per run, not one per attempt: a catch-up run or a re-run the
+    # same day would otherwise stack identical notes on the lead.
+    body = re.sub(r"<[^>]+>", "", note).strip()
+    for n in notes or []:
+        if re.sub(r"<[^>]+>", "", str(n.get("content") or "")).strip() == body:
+            row["status"] = VERIFIED_NOPAY
+            row["reason"] = "identical note already posted today"
+            return row
+
     if client.post_note(int(lead_id), note, pin=True):
         if fresh:
             posted[str(lead_id)] = list(seen | {payment_key(p) for p in fresh})
