@@ -707,11 +707,23 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
         row["crm"] = post_to_crm(lead_id, note)
     else:
         row["status"] = BLOCKED
-        row["reason"] = "live data OK but Lofty post_note failed"
+        row["reason"] = f"live data OK but posting the note to {'the CRM' if SOURCE == 'crm' else 'Lofty'} failed"
     return row
 
 
 CRM_URL = os.getenv("CRM_URL", "https://dirty-deed-db.onrender.com").rstrip("/")
+# Raul 2026-09-28: "starting this Saturday ... we're going to go in [the new CRM]. I'm canceling
+# Lofty this week." So the CRM is where leads come from and where notes go. --source lofty still
+# works for as long as the Lofty account does.
+# Without the CRM key it falls back to Lofty (loudly) rather than failing the whole Saturday run.
+SOURCE = os.getenv("TAX_WATCH_SOURCE", "").strip().lower() or (
+    "crm" if os.getenv("CRM_BOT_API_KEY", "").strip() else "lofty")
+
+
+def lead_link(lead_id) -> str:
+    if SOURCE == "crm":
+        return f"{CRM_URL}/crm#lead/{lead_id}"
+    return f"https://crm.lofty.com/admin/home/detail?leadId={lead_id}&type=all"
 
 
 def post_to_crm(lead_id, note: str) -> str:
@@ -720,6 +732,8 @@ def post_to_crm(lead_id, note: str) -> str:
     weeks itself, so this is one call. -> posted | already | not in CRM | off | failed: ...
 
     Lofty stays the system of record for this bot; a CRM failure is reported, never fatal."""
+    if SOURCE == "crm":
+        return ""          # client.post_note already wrote it to the CRM
     key = os.getenv("CRM_BOT_API_KEY", "").strip()
     if not key:
         return "off"
@@ -777,7 +791,10 @@ def main():
     ap.add_argument("--restate-days", type=int, default=RESTATE_DAYS,
                     help="how often to restate an unchanged 'still not paid' note")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--source", choices=["crm", "lofty"], default=SOURCE,
+                    help="where leads come from and notes go (default crm; Lofty is being cancelled)")
     a = ap.parse_args()
+    globals()["SOURCE"] = a.source
     only = {c.strip().upper() for c in a.counties.split(",") if c.strip()}
 
     now = datetime.now(timezone.utc)
@@ -792,16 +809,28 @@ def main():
     if unknown:
         sys.exit(f"unknown stage(s) {unknown}; choose from {list(STAGES)}. "
                  f"Refusing to run a partial pipeline set.")
-    stage_ids = {STAGES[s]: s for s in want}
+    if a.source == "crm":
+        from crm_client import CRM_STAGES
+        stage_ids = {CRM_STAGES[s]: s for s in want}
+    else:
+        stage_ids = {STAGES[s]: s for s in want}
     if not stage_ids:
         sys.exit(f"no valid stages in {a.stages!r}; choose from {list(STAGES)}")
 
+    print(f"source: {'CRM ' + CRM_URL if a.source == 'crm' else 'Lofty'}")
+    if a.source == "lofty" and not os.getenv("CRM_BOT_API_KEY", "").strip():
+        print("WARNING: CRM_BOT_API_KEY is not set, so this run reads and writes LOFTY. Once Lofty is "
+              "cancelled this run will fail: set CRM_BOT_API_KEY to the CRM's BOT_API_KEY.")
     print(f"tax_watch — lookback {a.lookback}d | stages {list(stage_ids.values())} | "
           f"{'DRY RUN' if a.dry_run else 'LIVE (will post notes)'}")
     print(f"live adapters: {', '.join(supported_counties())}")
     print(f"no adapter yet (will BLOCK): {', '.join(UNSUPPORTED)}\n")
 
-    client = LoftyClient()
+    if a.source == "crm":
+        from crm_client import CrmClient
+        client = CrmClient()
+    else:
+        client = LoftyClient()
     cache = _load(ACCOUNT_CACHE, {})
     posted = _load(POSTED_STATE, {})
 
@@ -811,6 +840,13 @@ def main():
         print(f"lead source: {a.csv} ({len(buckets[0])} leads)")
     else:
         buckets = client.list_leads_in_stages(list(stage_ids))
+        if a.source == "crm":
+            # The account cache and the noted-payments ledger were learned under Lofty lead ids.
+            # Carry them over to the CRM's ids so no county search has to be re-learned.
+            for pid, lid in client.lofty_ids.items():
+                for store in (cache, posted):
+                    if lid in store and pid not in store:
+                        store[pid] = store[lid]
 
     rows = []
     done_ids = set()
@@ -871,12 +907,12 @@ def main():
     with open(lead_csv, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["lead_id", "name", "pipeline", "county", "status", "reason",
-                    "balance", "account", "lofty_link", "crm"])
+                    "balance", "account", "link", "crm"])
         for r in rows:
             w.writerow([r.get("lead_id"), r.get("name"), r.get("pipeline"),
                         r.get("county"), r.get("status"), r.get("reason"),
                         r.get("balance", ""), r.get("account", ""),
-                        f"https://crm.lofty.com/admin/home/detail?leadId={r.get('lead_id')}&type=all",
+                        lead_link(r.get("lead_id")),
                         r.get("crm", "")])
 
     posted = counts[VERIFIED_PAID] + counts[VERIFIED_UNPAID]
@@ -909,12 +945,11 @@ def post_slack_summary(rows, counts, by_county, stage_ids, today_str):
     from slack_client import post_to_slack
 
     def link(r):
-        return (f"<https://crm.lofty.com/admin/home/detail?leadId={r['lead_id']}&type=all"
-                f"|{str(r['name'])[:30] or r['lead_id']}>")
+        return f"<{lead_link(r['lead_id'])}|{str(r['name'])[:30] or r['lead_id']}>"
 
     paid = [r for r in rows if r["status"] == VERIFIED_PAID]
     blocked = [r for r in rows if r["status"] == BLOCKED]
-    lines = [f"*Lofty tax watch {today_str}* - {len(rows)} leads "
+    lines = [f"*Tax watch {today_str}* ({'CRM' if SOURCE == 'crm' else 'Lofty'}) - {len(rows)} leads "
              f"({', '.join(stage_ids.values())})",
              f"Notes posted: *{counts[VERIFIED_PAID]} paid*, {counts[VERIFIED_UNPAID]} still not paid | "
              f"refreshed {counts[VERIFIED_NOPAY]} | *blocked {counts[BLOCKED]}*"]
