@@ -689,6 +689,9 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
         if re.sub(r"<[^>]+>", "", str(n.get("content") or "")).strip() == body:
             row["status"] = VERIFIED_NOPAY
             row["reason"] = "identical note already posted today"
+            # Lofty has it, but the CRM may not (it was down, or this lead was
+            # added to it since). The CRM call is idempotent, so just make sure.
+            row["crm"] = post_to_crm(lead_id, note)
             return row
 
     if client.post_note(int(lead_id), note, pin=True):
@@ -701,10 +704,37 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
                 client.set_note_pin(int(lead_id), old["id"], old["body"], False)
         row["status"] = outcome
         row["reason"] = "note posted"
+        row["crm"] = post_to_crm(lead_id, note)
     else:
         row["status"] = BLOCKED
         row["reason"] = "live data OK but Lofty post_note failed"
     return row
+
+
+CRM_URL = os.getenv("CRM_URL", "https://dirty-deed-db.onrender.com").rstrip("/")
+
+
+def post_to_crm(lead_id, note: str) -> str:
+    """Put the same note on the lead in Raul's own CRM (Raul 2026-09-28: "start posting the tax
+    updates on my new CRM"). The CRM keeps only the newest TAX UPDATE per lead and hides the older
+    weeks itself, so this is one call. -> posted | already | not in CRM | off | failed: ...
+
+    Lofty stays the system of record for this bot; a CRM failure is reported, never fatal."""
+    key = os.getenv("CRM_BOT_API_KEY", "").strip()
+    if not key:
+        return "off"
+    import requests
+    try:
+        r = requests.post(f"{CRM_URL}/api/bot/tax-update", headers={"X-API-Key": key}, timeout=60,
+                          json={"lofty_lead_id": int(lead_id), "body": re.sub(r"<[^>]+>", "", note).strip()})
+        if r.status_code != 200:
+            return f"failed: HTTP {r.status_code}"
+        j = r.json()
+        if not j.get("found"):
+            return "not in CRM"
+        return "posted" if j.get("posted") else "already"
+    except Exception as e:  # noqa: BLE001
+        return f"failed: {type(e).__name__}"
 
 
 def leads_from_csv(path: str) -> list[dict]:
@@ -841,12 +871,13 @@ def main():
     with open(lead_csv, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["lead_id", "name", "pipeline", "county", "status", "reason",
-                    "balance", "account", "lofty_link"])
+                    "balance", "account", "lofty_link", "crm"])
         for r in rows:
             w.writerow([r.get("lead_id"), r.get("name"), r.get("pipeline"),
                         r.get("county"), r.get("status"), r.get("reason"),
                         r.get("balance", ""), r.get("account", ""),
-                        f"https://crm.lofty.com/admin/home/detail?leadId={r.get('lead_id')}&type=all"])
+                        f"https://crm.lofty.com/admin/home/detail?leadId={r.get('lead_id')}&type=all",
+                        r.get("crm", "")])
 
     posted = counts[VERIFIED_PAID] + counts[VERIFIED_UNPAID]
     print(f"\n{'='*72}")
@@ -859,6 +890,11 @@ def main():
         tot = sum(v.values())
         print(f"  {c[:16]:18s} verified {ver:3d}/{tot:<3d}  blocked {v[BLOCKED]:3d}"
               + (f"   <- {reasons[c].most_common(1)[0][0][:44]}" if reasons[c] else ""))
+    crm = Counter((r.get("crm") or "")[:7] for r in rows if r.get("crm"))
+    if crm:
+        print(f"CRM ({CRM_URL}): posted {crm['posted']} | already there {crm['already']} | "
+              f"lead not in CRM {crm['not in ']} | failed {crm['failed:']}"
+              + (" | CRM_BOT_API_KEY not set, CRM skipped" if crm['off'] else ""))
     print(f"\ncoverage ledger -> {COVERAGE_LOG}")
     if counts[BLOCKED]:
         print("BLOCKED leads were NOT guessed from notes. Build the adapter or verify by hand.")
