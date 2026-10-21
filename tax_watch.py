@@ -1,4 +1,4 @@
-"""tax_watch — autonomous live-county tax watcher that writes notes onto Lofty.
+"""tax_watch — autonomous live-county tax watcher that writes notes onto Raul's CRM (NEVER Lofty).
 
 WHAT IT DOES, EVERY RUN
 -----------------------
@@ -7,7 +7,7 @@ For every lead in the target pipelines:
      number, owner name, property address). Never for tax figures.
   2. Hit that county's tax portal LIVE and read the real balance + the full
      payment receipt history.
-  3. If a payment posted inside the lookback window, write a note on the Lofty
+  3. If a payment posted inside the lookback window, write a note on the CRM
      lead: how much, by who, and the balance still owed.
   4. If the county can't be verified, record it as BLOCKED. Never guess.
 
@@ -50,7 +50,6 @@ from county_adapters import (get_adapter, supported_counties, canonical_county,
                              UNSUPPORTED, ESEARCH_CAD, cad_adapter, cad_situs)
 import bulk_rolls  # noqa: F401  — registers Bell/Taylor bulk-roll adapters
 import cameron_live  # noqa: F401  — registers the live Cameron adapter
-from lofty_client import LoftyClient
 from note_parser import parse_lead_summary, ParsedSummary
 from lead_locator import (lead_property_address, county_for_address,
                           locate_from_notes, lead_record_county)
@@ -344,6 +343,13 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
     if not owner_keys and lead_key and parsed.property_address:
         search_plan.append(("lead_name", {"owner": lead_key}))
     ambiguous = ""
+    # A lone owner-name hit whose site address is a DIFFERENT street is held
+    # back until the address search has had its turn: on 10/3/26 "PLUMMER
+    # LETITIA" pinned 2006 Covent Garden ($0) while the lead's parcel, 3324 S
+    # MacGregor, owed $58,736. Used only if nothing address-based pins a parcel
+    # (the note's address can be the owner's mailing address).
+    deferred = None
+    pinned_err = ""
     for field_name, kwargs in search_plan:
         if not list(kwargs.values())[0]:
             continue
@@ -385,9 +391,15 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
                     f"{'' if not narrowed else f'_{len(narrowed)}_after_address'}")
                 continue
             hits = narrowed
+        elif (field_name == "owner" and parsed.property_address
+              and hits[0].get("site_address")
+              and not _match_by_address(hits, parsed.property_address)):
+            deferred = deferred or hits[0]["account"]
+            continue
         r = _try(hits[0]["account"], f"portal_search_{field_name}")
         if r:
             return r
+        pinned_err = pinned_err or (last_err or "")
 
     # 4. Appraisal-district fallback, keyed by the note's Property Id.
     #    The CAD knows the real SITUS address (Lofty's can be the owner's
@@ -432,6 +444,15 @@ def resolve_and_lookup(adapter, parsed, cache: dict, lead_id: str):
             if st.verified:
                 return st, st.account, "cad_tax_table", ""
 
+    if deferred:
+        r = _try(deferred, "portal_search_owner_address_mismatch")
+        if r:
+            return r
+    if pinned_err:
+        # The parcel WAS found; the county just won't give a figure for it
+        # (Harris "pending certification review" / "under suit") - say that,
+        # not "ambiguous".
+        return None, "", "portal_search", f"live county check failed: {pinned_err}"
     if ambiguous:
         return None, "", "portal_search", ambiguous
     reason = (f"live county check failed: {last_err}" if last_err
@@ -606,7 +627,7 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
             row["located_by"] = "lofty_notes/address"
         elif not parsed.found:
             row["reason"] = ("no researcher summary and no property address or "
-                             "county anywhere on the Lofty lead — can't locate it")
+                             "county anywhere on the lead — can't locate it")
             return row
     parsed.lead_name = name
     row["county"] = canonical_county(parsed.county)
@@ -689,9 +710,6 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
         if re.sub(r"<[^>]+>", "", str(n.get("content") or "")).strip() == body:
             row["status"] = VERIFIED_NOPAY
             row["reason"] = "identical note already posted today"
-            # Lofty has it, but the CRM may not (it was down, or this lead was
-            # added to it since). The CRM call is idempotent, so just make sure.
-            row["crm"] = post_to_crm(lead_id, note)
             return row
 
     if client.post_note(int(lead_id), note, pin=True):
@@ -704,86 +722,27 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
                 client.set_note_pin(int(lead_id), old["id"], old["body"], False)
         row["status"] = outcome
         row["reason"] = "note posted"
-        row["crm"] = post_to_crm(lead_id, note)
     else:
         row["status"] = BLOCKED
-        row["reason"] = f"live data OK but posting the note to {'the CRM' if SOURCE == 'crm' else 'Lofty'} failed"
+        row["reason"] = "live data OK but posting the note to the CRM failed"
     return row
 
 
 CRM_URL = os.getenv("CRM_URL", "https://dirty-deed-db.onrender.com").rstrip("/")
-# Raul 2026-09-28: "starting this Saturday ... we're going to go in [the new CRM]. I'm canceling
-# Lofty this week." So the CRM is where leads come from and where notes go. --source lofty still
-# works for as long as the Lofty account does.
-# Without the CRM key it falls back to Lofty (loudly) rather than failing the whole Saturday run.
-SOURCE = os.getenv("TAX_WATCH_SOURCE", "").strip().lower() or (
-    "crm" if os.getenv("CRM_BOT_API_KEY", "").strip() else "lofty")
+# NEVER LOFTY (Raul 2026-10-21): "from now on and forever ... never put Lofty. We don't have Lofty
+# anymore." Leads come from Raul's CRM and every note goes to the CRM. There is no Lofty path and no
+# fallback: on 10/17/26 the old "no CRM key -> quietly use Lofty" fallback sent 796 notes to Lofty.
+# No CRM key = the run stops and says so (Slack too), it never touches Lofty.
+SOURCE = "crm"
 
 
 def lead_link(lead_id) -> str:
-    if SOURCE == "crm":
-        return f"{CRM_URL}/crm#lead/{lead_id}"
-    return f"https://crm.lofty.com/admin/home/detail?leadId={lead_id}&type=all"
-
-
-def post_to_crm(lead_id, note: str) -> str:
-    """Put the same note on the lead in Raul's own CRM (Raul 2026-09-28: "start posting the tax
-    updates on my new CRM"). The CRM keeps only the newest TAX UPDATE per lead and hides the older
-    weeks itself, so this is one call. -> posted | already | not in CRM | off | failed: ...
-
-    Lofty stays the system of record for this bot; a CRM failure is reported, never fatal."""
-    if SOURCE == "crm":
-        return ""          # client.post_note already wrote it to the CRM
-    key = os.getenv("CRM_BOT_API_KEY", "").strip()
-    if not key:
-        return "off"
-    import requests
-    try:
-        r = requests.post(f"{CRM_URL}/api/bot/tax-update", headers={"X-API-Key": key}, timeout=60,
-                          json={"lofty_lead_id": int(lead_id), "body": re.sub(r"<[^>]+>", "", note).strip()})
-        if r.status_code != 200:
-            return f"failed: HTTP {r.status_code}"
-        j = r.json()
-        if not j.get("found"):
-            return "not in CRM"
-        return "posted" if j.get("posted") else "already"
-    except Exception as e:  # noqa: BLE001
-        return f"failed: {type(e).__name__}"
-
-
-def leads_from_csv(path: str) -> list[dict]:
-    """Lead LIST from a Lofty CSV export. IDs only — notes still come from the API.
-
-    Why: listing a pipeline over the API means walking the whole ~35K-lead
-    workspace (350+ calls, ~10 min, and it dropped the connection mid-run on
-    2026-07-19). A pipeline CSV export names those leads instantly.
-
-    Why not the CSV's Note 1-10 columns: Lofty's exporter STRIPS the HTML, so
-    the summary collapses into one unpunctuated run
-    ("County: GALVESTONOwner: NORTON HERMAN% Ownership: 100.0%...") and the
-    field boundaries the parser needs are gone — county parsed as the entire
-    note body on 153/154 leads. The API returns the same note with its <p>/<br>
-    structure intact. So: CSV for WHICH leads, API for WHAT'S ON them.
-    """
-    import csv as _csv
-    out = []
-    with open(path, encoding="utf-8-sig") as fh:
-        for d in _csv.DictReader(fh):
-            lead_id = (d.get("Lead Id") or "").strip().strip("`")
-            if not lead_id:
-                continue
-            out.append({
-                "leadId": lead_id,
-                "firstName": (d.get("First Name") or "").strip(),
-                "lastName": (d.get("Last Name") or "").strip(),
-            })
-    return out
+    return f"{CRM_URL}/crm#lead/{lead_id}"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stages", default="hvt")
-    ap.add_argument("--csv", default="", help="Lofty pipeline CSV export (skips the slow API scan)")
     ap.add_argument("--counties", default="",
                     help="only process these counties, e.g. GALVESTON,ECTOR")
     ap.add_argument("--lookback", type=int, default=int(os.getenv("TAX_LOOKBACK_DAYS", "14")))
@@ -791,10 +750,14 @@ def main():
     ap.add_argument("--restate-days", type=int, default=RESTATE_DAYS,
                     help="how often to restate an unchanged 'still not paid' note")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--source", choices=["crm", "lofty"], default=SOURCE,
-                    help="where leads come from and notes go (default crm; Lofty is being cancelled)")
     a = ap.parse_args()
-    globals()["SOURCE"] = a.source
+    if not os.getenv("CRM_BOT_API_KEY", "").strip():
+        msg = ("tax_watch STOPPED: CRM_BOT_API_KEY is not set, so it cannot reach Raul's CRM. "
+               "It will NOT fall back to Lofty (Lofty is gone). Set the key and redeploy.")
+        if not a.dry_run and os.getenv("SLACK_WEBHOOK_URL", "").strip():
+            from slack_client import post_to_slack
+            post_to_slack(os.getenv("SLACK_WEBHOOK_URL").strip(), {"text": ":rotating_light: " + msg})
+        sys.exit(msg)
     only = {c.strip().upper() for c in a.counties.split(",") if c.strip()}
 
     now = datetime.now(timezone.utc)
@@ -809,44 +772,29 @@ def main():
     if unknown:
         sys.exit(f"unknown stage(s) {unknown}; choose from {list(STAGES)}. "
                  f"Refusing to run a partial pipeline set.")
-    if a.source == "crm":
-        from crm_client import CRM_STAGES
-        stage_ids = {CRM_STAGES[s]: s for s in want}
-    else:
-        stage_ids = {STAGES[s]: s for s in want}
+    from crm_client import CRM_STAGES
+    stage_ids = {CRM_STAGES[s]: s for s in want}
     if not stage_ids:
         sys.exit(f"no valid stages in {a.stages!r}; choose from {list(STAGES)}")
 
-    print(f"source: {'CRM ' + CRM_URL if a.source == 'crm' else 'Lofty'}")
-    if a.source == "lofty" and not os.getenv("CRM_BOT_API_KEY", "").strip():
-        print("WARNING: CRM_BOT_API_KEY is not set, so this run reads and writes LOFTY. Once Lofty is "
-              "cancelled this run will fail: set CRM_BOT_API_KEY to the CRM's BOT_API_KEY.")
+    print(f"source: CRM {CRM_URL} (never Lofty)")
     print(f"tax_watch — lookback {a.lookback}d | stages {list(stage_ids.values())} | "
           f"{'DRY RUN' if a.dry_run else 'LIVE (will post notes)'}")
     print(f"live adapters: {', '.join(supported_counties())}")
     print(f"no adapter yet (will BLOCK): {', '.join(UNSUPPORTED)}\n")
 
-    if a.source == "crm":
-        from crm_client import CrmClient
-        client = CrmClient()
-    else:
-        client = LoftyClient()
+    from crm_client import CrmClient
+    client = CrmClient()
     cache = _load(ACCOUNT_CACHE, {})
     posted = _load(POSTED_STATE, {})
 
-    if a.csv:
-        buckets = {0: leads_from_csv(a.csv)}
-        stage_ids = {0: Path(a.csv).stem[:24]}
-        print(f"lead source: {a.csv} ({len(buckets[0])} leads)")
-    else:
-        buckets = client.list_leads_in_stages(list(stage_ids))
-        if a.source == "crm":
-            # The account cache and the noted-payments ledger were learned under Lofty lead ids.
-            # Carry them over to the CRM's ids so no county search has to be re-learned.
-            for pid, lid in client.lofty_ids.items():
-                for store in (cache, posted):
-                    if lid in store and pid not in store:
-                        store[pid] = store[lid]
+    buckets = client.list_leads_in_stages(list(stage_ids))
+    # The account cache and the noted-payments ledger were learned under the old Lofty lead ids.
+    # Carry them over to the CRM's ids so no county search has to be re-learned (read-only mapping).
+    for pid, lid in client.lofty_ids.items():
+        for store in (cache, posted):
+            if lid in store and pid not in store:
+                store[pid] = store[lid]
 
     rows = []
     done_ids = set()
@@ -926,11 +874,6 @@ def main():
         tot = sum(v.values())
         print(f"  {c[:16]:18s} verified {ver:3d}/{tot:<3d}  blocked {v[BLOCKED]:3d}"
               + (f"   <- {reasons[c].most_common(1)[0][0][:44]}" if reasons[c] else ""))
-    crm = Counter((r.get("crm") or "")[:7] for r in rows if r.get("crm"))
-    if crm:
-        print(f"CRM ({CRM_URL}): posted {crm['posted']} | already there {crm['already']} | "
-              f"lead not in CRM {crm['not in ']} | failed {crm['failed:']}"
-              + (" | CRM_BOT_API_KEY not set, CRM skipped" if crm['off'] else ""))
     print(f"\ncoverage ledger -> {COVERAGE_LOG}")
     if counts[BLOCKED]:
         print("BLOCKED leads were NOT guessed from notes. Build the adapter or verify by hand.")
@@ -949,7 +892,7 @@ def post_slack_summary(rows, counts, by_county, stage_ids, today_str):
 
     paid = [r for r in rows if r["status"] == VERIFIED_PAID]
     blocked = [r for r in rows if r["status"] == BLOCKED]
-    lines = [f"*Tax watch {today_str}* ({'CRM' if SOURCE == 'crm' else 'Lofty'}) - {len(rows)} leads "
+    lines = [f"*Tax watch {today_str}* (CRM) - {len(rows)} leads "
              f"({', '.join(stage_ids.values())})",
              f"Notes posted: *{counts[VERIFIED_PAID]} paid*, {counts[VERIFIED_UNPAID]} still not paid | "
              f"refreshed {counts[VERIFIED_NOPAY]} | *blocked {counts[BLOCKED]}*"]
