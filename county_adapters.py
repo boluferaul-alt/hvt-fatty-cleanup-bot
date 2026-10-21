@@ -366,7 +366,9 @@ class ACTModernAdapter(ACTAdapter):
                         data={"criteria": crit, "search-type": stype,
                               "altCriteria": ""}, timeout=30)
         time.sleep(REQUEST_DELAY_SEC)
-        m = re.search(r'var result\s*=\s*(\{.*?\});', r.text, re.S)
+        # Ector names the blob `result`; Montgomery's 2026 skin names it
+        # `searchResults` (moved off /act_webdev/montgomery, which now 404s).
+        m = re.search(r'var (?:result|searchResults)\s*=\s*(\{.*?\});', r.text, re.S)
         if not m:
             return []
         import json as _json
@@ -672,6 +674,31 @@ class CaldwellCADAdapter:
             st.owner = mo.group(1).strip()[:120]
         st.verified = True
         st.verified_at = datetime.now(timezone.utc).isoformat()
+        return st
+
+
+class HoodCADAdapter(CaldwellCADAdapter):
+    """HOOD — Hood CAD collects the taxes and runs the same BIS eSearch +
+    ArcGIS feature service as Caldwell (added 10/4/26 for Thomas Boulton,
+    6208 New Mexico Trl, Granbury = prop 17702).
+
+    The parcel layer answers fine. esearch.hoodcad.net reset every connection
+    on 10/4/26 from the laptop, the browser and an outside fetcher alike (site
+    down, not a bot wall), so until it is back the lookup fails and the lead
+    BLOCKS. go2gov's Hood page is a blind pay-an-amount form with no balance.
+    """
+
+    GIS = ("https://services.arcgis.com/n4964dyKb7h58xBo/arcgis/rest/services/"
+           "HoodCADWebService/FeatureServer/0/query")
+    BASE = "https://esearch.hoodcad.net"
+
+    def __init__(self, county: str = "HOOD", slug=None, session: Optional[requests.Session] = None):
+        super().__init__(county, slug or self.BASE, session=session)
+
+    def lookup(self, account: str) -> TaxStatus:
+        st = super().lookup(account)
+        if not st.verified and "ConnectionError" in (st.error or ""):
+            st.error = "Hood CAD tax site (esearch.hoodcad.net) is down / refusing connections"
         return st
 
 
@@ -1059,10 +1086,55 @@ class HarrisTaxAdapter:
                 hits = self._search("name", key.split()[0])
             return hits
         if address:
-            m = re.match(r"\s*(\d+\s+[A-Za-z0-9]+)", address)
+            # "3324 S MACGREGOR WAY" must search "3324 S MACGREGOR", not "3324 S"
+            # (the old number+first-word key hit 17-50 unrelated parcels, 10/3/26).
+            street = re.sub(r",.*$", "", address).strip().upper()
+            m = re.match(r"(\d+)\s+((?:[NSEW]\s+)?[A-Z0-9]+)", street)
             if m:
-                return self._search("address", m.group(1))
+                hits = self._search("address", f"{m.group(1)} {m.group(2)}")
+                hits = [h for h in hits if h["site_address"].upper().startswith(m.group(1) + " ")]
+                if hits:
+                    return hits
+            # Some parcels are missing from hctax's address index (5774 Hirondel,
+            # 4358 Alvin, 3324 S MacGregor on 10/3/26) but the county's own
+            # public HCAD parcel layer has them, account number included.
+            return self._gis_by_address(street)
         return []
+
+    GIS = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/MapServer/0/query"
+
+    def _gis_by_address(self, street: str) -> list[dict]:
+        # The note's address often carries the city before the comma
+        # ("5774 HIRONDEL ST HOUSTON"), so match on number + first name word,
+        # then keep only parcels whose full street name appears in the address.
+        m = re.match(r"(\d+)\s+(?:([NSEW])\s+)?([A-Z0-9]+)", street)
+        if not m:
+            return []
+        num, pfx, word = m.group(1), m.group(2) or "", m.group(3)
+        where = f"site_str_num={int(num)} AND site_str_name LIKE '{word}%'"
+        try:
+            r = self.s.get(self.GIS, params={
+                "where": where, "returnGeometry": "false", "f": "json",
+                "outFields": "acct_num,owner_name_1,site_str_pfx,site_str_num,"
+                             "site_str_name,site_str_sfx,site_zip"}, timeout=30)
+            feats = r.json().get("features") or []
+        except (requests.RequestException, ValueError):
+            return []
+        out = []
+        for f in feats:
+            a = f.get("attributes") or {}
+            if pfx and (a.get("site_str_pfx") or "").strip() not in ("", pfx):
+                continue
+            if str(a.get("site_str_name") or "").strip().upper() not in street:
+                continue
+            site = " ".join(str(x).strip() for x in (
+                a.get("site_str_num"), a.get("site_str_pfx"), a.get("site_str_name"),
+                a.get("site_str_sfx"), a.get("site_zip")) if x and str(x).strip())
+            if a.get("acct_num"):
+                out.append({"account": str(a["acct_num"]).strip(),
+                            "owner": str(a.get("owner_name_1") or "").strip(),
+                            "site_address": site, "long_account": ""})
+        return out
 
     _DELINQ_RE = re.compile(r"Total Due\s*>>>\s*\|?\s*\$?([\d,]+\.\d{2})")
     _CURRENT_RE = re.compile(r"Total Amount Due For [A-Za-z]+ \d{4}:\s*\|?\s*\$?([\d,]+\.\d{2})")
@@ -1102,6 +1174,17 @@ class HarrisTaxAdapter:
         t = t.replace("&amp;", "&").replace("&nbsp;", " ")
 
         m = self._DELINQ_RE.search(t) or self._CURRENT_RE.search(t)
+        if not m and re.search(r"Taxes Under \(Suit, Judgment or Bankruptcy\)", t):
+            st.error = (f"Harris tax office flags account {acct} 'Taxes Under (Suit, Judgment or "
+                        f"Bankruptcy)', balance only by phone 713-274-8000")
+            st.active_lawsuit = "Taxes under suit, judgment or bankruptcy (Harris tax office)"
+            return st
+        if not m and "pending certification review" in t:
+            # The county itself is withholding the statement (seen on 3 estates
+            # 10/3/26). Nothing to read until the review clears; say so plainly.
+            st.error = (f"Harris tax office has account {acct} on hold "
+                        f"('pending certification review'), no balance published; recheck next week")
+            return st
         if not m:
             st.error = f"could not read 'Total Due' for account {acct}"
             return st
@@ -1122,7 +1205,7 @@ class HarrisTaxAdapter:
 ACT_COUNTIES = {
     "GALVESTON":  (ACTAdapter, "galveston"),
     "FORT BEND":  (ACTAdapter, "fbc"),
-    "MONTGOMERY": (ACTAdapter, "montgomery"),
+    "MONTGOMERY": (ACTModernAdapter, "montgomery"),
     "JEFFERSON":  (ACTAdapter, "jefferson"),
     "ECTOR":      (ACTModernAdapter, "ectorcad"),
     "LIBERTY":    (PropertyTaxPaymentsAdapter, "https://liberty.propertytaxpayments.net"),
@@ -1130,6 +1213,7 @@ ACT_COUNTIES = {
     "HARRIS":     (HarrisTaxAdapter, None),
     "CALDWELL":   (CaldwellCADAdapter, None),
     "SAN JACINTO": (TylerProxyTAdapter, "https://sjc-tax.us"),
+    "HOOD":       (HoodCADAdapter, None),
 }
 
 # Counties with no live adapter yet — each needs one before the bot can verify
