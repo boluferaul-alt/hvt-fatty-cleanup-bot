@@ -445,6 +445,99 @@ class ACTModernAdapter(ACTAdapter):
         return out
 
 
+class ElPasoACTAdapter(ACTAdapter):
+    """El Paso — actweb.acttax.com/act_webdev/elpaso (classic ACT skin, cracked 10/24/26).
+
+    Differences from Galveston/Fort Bend:
+      * the tax account is the GEO id ("E01499902304100"), letters and all, so
+        the digits-only account handling elsewhere never matches it.
+      * the researcher note's "Property Id" is the CAD id (170408). The portal
+        has a Property ID search (searchby=5), so lookup() accepts either: a
+        bare number is turned into the geo account through that search first.
+      * the search form is GET, and its result rows end with "CAD Reference No."
+      * the detail page says "Account No." (not "Account Number") and has an
+        "Active Judgments" line: a judgment is a finished tax suit (LANE
+        10/22/26: judgment 2017DTX0451, $176K owed) so it counts as a lawsuit.
+    Same approach the research bot has used on Render since 10/22/26.
+    """
+
+    SEARCH_BY = {"owner": "3", "address": "6", "account": "4", "long_account": "5"}
+
+    def __init__(self, county: str = "EL PASO", slug: str = "elpaso",
+                 session: Optional[requests.Session] = None):
+        super().__init__(county, slug or "elpaso", session=session)
+
+    def _search(self, by: str, crit: str) -> list[dict]:
+        self._prime()
+        r = self.s.get(f"{self.base}/showlist.jsp",
+                       params={"searchby": by, "criteria": crit}, timeout=30)
+        time.sleep(REQUEST_DELAY_SEC)
+        out = []
+        for cells in _rows(r.text):
+            # rows open with the account twice ("E0149... E0149...")
+            m = re.match(r"^([A-Z0-9]{10,})(?:\s+\1)?$", cells[0].strip())
+            if m and len(cells) >= 5:
+                out.append({"account": m.group(1), "owner": cells[1],
+                            "site_address": cells[2], "long_account": cells[-1]})
+        return out
+
+    def find_account(self, *, owner: str = "", address: str = "",
+                     long_account: str = "") -> list[dict]:
+        if long_account:
+            g = re.sub(r"[^A-Za-z0-9]", "", long_account).upper()
+            return self._search("5" if g.isdigit() else "4", g)
+        if owner:
+            return self._search("3", owner)
+        if address:
+            return self._search("6", address)
+        return []
+
+    def lookup(self, account: str) -> TaxStatus:
+        acct = re.sub(r"[^A-Za-z0-9]", "", str(account)).upper()
+        st = TaxStatus(county=self.county, account=acct)
+        if acct.isdigit():
+            try:
+                hits = self._search("5", acct)
+            except requests.RequestException as e:
+                st.error = f"property id search failed: {type(e).__name__}"
+                return st
+            if len(hits) != 1:
+                st.error = f"property id {acct} matched {len(hits)} El Paso tax accounts"
+                return st
+            acct = st.account = hits[0]["account"]
+        st.source_url = f"{self.base}/showdetail2.jsp?can={acct}"
+        try:
+            self._prime()
+            r = self.s.get(f"{self.base}/showdetail2.jsp",
+                           params={"can": acct, "ownerno": "0"}, timeout=30)
+            time.sleep(REQUEST_DELAY_SEC)
+        except requests.RequestException as e:
+            st.error = f"detail request failed: {type(e).__name__}"
+            return st
+        text = _clean(r.text)
+        if r.status_code != 200 or "Account No." not in text:
+            st.error = f"no account record for '{acct}'"
+            return st
+        m = re.search(r"Address:\s*(.*?)\s+Property Site Address:", text)
+        st.owner = m.group(1).strip() if m else ""
+        m = re.search(r"Property Site Address:\s*(.*?)\s+Legal Description:", text)
+        st.site_address = m.group(1).strip() if m else ""
+        m = re.search(r"Active Lawsuits:\s*(.*?)\s+Active Judgments:", text)
+        st.active_lawsuit = _clean_lawsuit(m.group(1) if m else "")
+        j = re.search(r"Active Judgments:\s*(.*?)\s+(?:Click Here|Pay Now|Payment Information)", text)
+        judgment = _clean_lawsuit(j.group(1) if j else "")
+        if judgment and not st.active_lawsuit:
+            st.active_lawsuit = f"judgment {judgment}"
+        st.total_due = self._total_due(text)
+        if st.total_due is None:
+            st.error = "could not read the total-due figure from the live page"
+            return st
+        st.payments = self._payments(acct)
+        st.verified = True
+        st.verified_at = datetime.now(timezone.utc).isoformat()
+        return st
+
+
 class TaxSysAdapter:
     """The '/Accounts/AccountDetails' platform — Liberty (and Brazoria).
 
@@ -1214,6 +1307,7 @@ ACT_COUNTIES = {
     "CALDWELL":   (CaldwellCADAdapter, None),
     "SAN JACINTO": (TylerProxyTAdapter, "https://sjc-tax.us"),
     "HOOD":       (HoodCADAdapter, None),
+    "EL PASO":    (ElPasoACTAdapter, "elpaso"),
 }
 
 # Counties with no live adapter yet — each needs one before the bot can verify
@@ -1222,7 +1316,13 @@ ACT_COUNTIES = {
 # BRAZORIA runs the same software as Liberty but is behind Cloudflare (403 to
 # plain HTTP). Options are a licensed feed (TaxNetUSA/LienSuite), a bulk county
 # file, or a runner on Raul's own Chrome — not defeating the challenge.
-UNSUPPORTED = ["BELL", "TAYLOR", "WALKER", "CAMERON"]
+#
+# AUSTIN (tax.austincad.org) and RANDALL (randallcounty.propertytaxpayments.net)
+# are the same propertytaxpayments.net software, but their Search/Results page
+# demands a Cloudflare Turnstile token ("Please complete the Security Check")
+# before it lists any account (checked 10/24/26). That is a captcha: never
+# evade it. They stay BLOCKED until a licensed feed or Raul's own browser.
+UNSUPPORTED = ["BELL", "TAYLOR", "WALKER", "CAMERON", "AUSTIN", "RANDALL"]
 
 
 def canonical_county(county: str) -> str:
