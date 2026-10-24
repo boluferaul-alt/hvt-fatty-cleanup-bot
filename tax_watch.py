@@ -879,34 +879,52 @@ def main():
         post_slack_summary(rows, counts, by_county, stage_ids, today_str)
 
 
-def post_slack_summary(rows, counts, by_county, stage_ids, today_str):
-    """Weekly report to Slack - the run is unattended on Render, so this is
-    how Raul sees what it did. Posted by the CRM's Slack app (10/24/26), never the old
-    Hot Occ Alive Cleanup Bot webhook."""
-    from crm_client import CrmClient
+# Why a lead got stuck -> what happens about it. Raul 10/24/26: "how many were checked, how many
+# paid, how many unpaid, how many stuck, and what's your plan to fix the stuck. That's it."
+STUCK_PLANS = [
+    (("403", "challenge", "refused"), "their tax sites block Render; the laptop catch-up checks them Saturday 11am"),
+    (("no live adapter",), "no reader for that county's tax site in the tax watch yet"),
+    (("ambiguous",), "more than one tax account matches the owner; pick the right one by hand"),
+    (("no account found",), "the county site has no account under that name; check the parcel id"),
+]
 
-    def link(r):
-        return f"<{lead_link(r['lead_id'])}|{str(r['name'])[:30] or r['lead_id']}>"
+
+def _leads_url(ids, title):
+    from urllib.parse import quote
+    base = os.getenv("CRM_URL", "https://dirty-deed-db.onrender.com").rstrip("/")
+    return f"{base}/api/crm/leads-list?ids={','.join(str(i) for i in ids)}&t={quote(title)}"
+
+
+def slack_summary_text(rows, today_str):
+    """The short Saturday message: four numbers (each a link to its leads) and a plan per kind of stuck."""
+    def num(sel, title):
+        ids = [r["lead_id"] for r in sel if str(r.get("lead_id", "")).isdigit()]
+        return f"<{_leads_url(ids, title + ' ' + today_str)}|{len(sel)}>" if ids else str(len(sel))
 
     paid = [r for r in rows if r["status"] == VERIFIED_PAID]
-    blocked = [r for r in rows if r["status"] == BLOCKED]
-    lines = [f"*Tax watch {today_str}* (CRM) - {len(rows)} leads "
-             f"({', '.join(stage_ids.values())})",
-             f"Notes posted: *{counts[VERIFIED_PAID]} paid*, {counts[VERIFIED_UNPAID]} still not paid | "
-             f"refreshed {counts[VERIFIED_NOPAY]} | *blocked {counts[BLOCKED]}*"]
-    if paid:
-        lines.append("\n*TAXES PAID:*")
-        lines += [f"- {link(r)} ({r['county'].title()}, {r['pipeline']}): {r.get('note','')[23:140]}"
-                  for r in paid]
-    if blocked:
-        lines.append("\n*BLOCKED - not verified, fix by hand:*")
-        lines += [f"- {link(r)} ({r['county'].title() or 'no county'}, {r['pipeline']}): {r['reason'][:80]}"
-                  for r in blocked[:60]]
-    lines.append("\n*By county (verified/total):* " + ", ".join(
-        f"{c.title()} {v[VERIFIED_PAID] + v[VERIFIED_UNPAID] + v[VERIFIED_NOPAY]}/{sum(v.values())}"
-        for c, v in sorted(by_county.items(), key=lambda kv: -sum(kv[1].values()))))
-    text = "\n".join(lines)
-    ok = CrmClient().post_slack(text[:39000])
+    unpaid = [r for r in rows if r["status"] in (VERIFIED_UNPAID, VERIFIED_NOPAY)]
+    stuck = [r for r in rows if r["status"] == BLOCKED]
+    lines = [f"*Tax watch {today_str}*",
+             f"Checked {len(rows)} | Paid {num(paid, 'Taxes paid')} | Not paid {len(unpaid)} | Stuck {num(stuck, 'Tax watch stuck')}"]
+    groups = {}
+    for r in stuck:
+        why = (r.get("reason") or "").lower()
+        plan = next((p for keys, p in STUCK_PLANS if any(k in why for k in keys)), None)
+        groups.setdefault(plan or f"other: {(r.get('reason') or 'unknown')[:60]}", []).append(r)
+    if groups:
+        lines.append("Plan for the stuck:")
+        for plan, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            counties = ", ".join(sorted({(r.get("county") or "no county").title() for r in rs}))
+            lines.append(f"• {num(rs, 'Stuck: ' + counties)} {counties}: {plan}")
+    return "\n".join(lines)
+
+
+def post_slack_summary(rows, counts, by_county, stage_ids, today_str):
+    """Weekly report to Slack - the run is unattended on Render, so this is how Raul sees what it
+    did. Posted in #dirtydeedbot by the CRM's Slack app (10/24/26). The per-lead detail is in the
+    pinned TAX UPDATE notes and state/last_run_leads.csv."""
+    from crm_client import CrmClient
+    ok = CrmClient().post_slack(slack_summary_text(rows, today_str)[:39000])
     print(f"[slack] summary {'posted' if ok else 'FAILED'}")
 
 
