@@ -73,6 +73,16 @@ class CrmClient:
         except requests.RequestException:
             return False
 
+    def post_slack(self, text: str) -> bool:
+        """The weekly summary, posted in #dirtydeedbot by the CRM's own Slack app. Raul 10/24/26:
+        the old incoming webhook belonged to the "Hot Occ Alive Cleanup Bot" app, so every report
+        arrived under that name - "I don't need that bot anymore." """
+        try:
+            r = self.s.post(f"{self.url}/api/crm/bot/slack/post", timeout=60, json={"text": text})
+            return r.status_code == 200 and bool(r.json().get("ok"))
+        except requests.RequestException:
+            return False
+
     def set_note_pin(self, *_a, **_k) -> bool:
         return True       # the CRM already unpinned (and hid) the old tax notes when the new one landed
 

@@ -754,10 +754,7 @@ def main():
     if not os.getenv("CRM_BOT_API_KEY", "").strip():
         msg = ("tax_watch STOPPED: CRM_BOT_API_KEY is not set, so it cannot reach Raul's CRM. "
                "It will NOT fall back to Lofty (Lofty is gone). Set the key and redeploy.")
-        if not a.dry_run and os.getenv("SLACK_WEBHOOK_URL", "").strip():
-            from slack_client import post_to_slack
-            post_to_slack(os.getenv("SLACK_WEBHOOK_URL").strip(), {"text": ":rotating_light: " + msg})
-        sys.exit(msg)
+        sys.exit(msg)          # no key means no CRM, and the CRM is the only way to Slack now
     only = {c.strip().upper() for c in a.counties.split(",") if c.strip()}
 
     now = datetime.now(timezone.utc)
@@ -878,14 +875,15 @@ def main():
     if counts[BLOCKED]:
         print("BLOCKED leads were NOT guessed from notes. Build the adapter or verify by hand.")
 
-    if not a.dry_run and os.getenv("SLACK_WEBHOOK_URL", "").strip():
+    if not a.dry_run:
         post_slack_summary(rows, counts, by_county, stage_ids, today_str)
 
 
 def post_slack_summary(rows, counts, by_county, stage_ids, today_str):
     """Weekly report to Slack - the run is unattended on Render, so this is
-    how Raul sees what it did."""
-    from slack_client import post_to_slack
+    how Raul sees what it did. Posted by the CRM's Slack app (10/24/26), never the old
+    Hot Occ Alive Cleanup Bot webhook."""
+    from crm_client import CrmClient
 
     def link(r):
         return f"<{lead_link(r['lead_id'])}|{str(r['name'])[:30] or r['lead_id']}>"
@@ -908,7 +906,7 @@ def post_slack_summary(rows, counts, by_county, stage_ids, today_str):
         f"{c.title()} {v[VERIFIED_PAID] + v[VERIFIED_UNPAID] + v[VERIFIED_NOPAY]}/{sum(v.values())}"
         for c, v in sorted(by_county.items(), key=lambda kv: -sum(kv[1].values()))))
     text = "\n".join(lines)
-    ok = post_to_slack(os.getenv("SLACK_WEBHOOK_URL").strip(), {"text": text[:39000]})
+    ok = CrmClient().post_slack(text[:39000])
     print(f"[slack] summary {'posted' if ok else 'FAILED'}")
 
 
