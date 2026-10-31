@@ -827,6 +827,8 @@ class TylerProxyTAdapter:
     """
 
     SEARCH_DELAY = 2.5
+    SEARCH_PATH = "/ProxyT/Search/Properties/"
+    SEARCH_PARAMS: dict = {}
 
     def __init__(self, county: str, base: str, session: Optional[requests.Session] = None):
         self.county = county
@@ -861,8 +863,9 @@ class TylerProxyTAdapter:
                  [str(datetime.now(timezone.utc).year - n) for n in range(0, 3)])
         for ty in years:
             try:
-                r = self.s.get(f"{self.base}/ProxyT/Search/Properties/",
-                               params={"f": text, "ty": ty}, timeout=45)
+                r = self.s.get(f"{self.base}{self.SEARCH_PATH}",
+                               params={"f": text, "ty": ty, **self.SEARCH_PARAMS},
+                               timeout=45)
                 time.sleep(self.SEARCH_DELAY)
             except requests.RequestException:
                 return []
@@ -941,6 +944,7 @@ class TylerProxyTAdapter:
             st.error = f"detail HTTP {r.status_code}"
             return st
 
+        self.last_html = r.text
         text = _clean(r.text)
         m = self._DUE_RE.search(text)
         if not m:
@@ -959,6 +963,52 @@ class TylerProxyTAdapter:
             st.site_address = ms.group(1).strip()[:120]
         st.verified = True
         st.verified_at = datetime.now(timezone.utc).isoformat()
+        return st
+
+
+class WallerTylerAdapter(TylerProxyTAdapter):
+    """Waller — tax.co.waller.tx.us, same Tyler site as San Jacinto (cracked 10/31/26).
+
+      * plain http; the site's own https has a bad certificate.
+      * the proxy path differs (/Proxy-Waller/, a hidden input on the home page)
+        and the search goes through /quick/.
+      * the account is "R" + the note's Property Id (8189 -> R8189).
+      * unlike San Jacinto, the Payment History tab is in the served HTML, so
+        receipts come through: dates and amounts, but NO payer name.
+
+    LIMITATION: this office does not collect for Waller ISD or the City of
+    Prairie View. Those bill through waller.go2gov.net, so a parcel in them can
+    owe more than this balance, and the note must say so.
+    """
+
+    SEARCH_PATH = "/Proxy-Waller/Search/Properties/quick/"
+    SEARCH_PARAMS = {"pn": 1, "st": 4, "so": "desc", "pt": "RP;PP;MH;NR"}
+    PAYER_UNKNOWN = "payer not published"
+
+    def __init__(self, county: str = "WALLER", slug=None,
+                 session: Optional[requests.Session] = None):
+        super().__init__(county, slug or "http://tax.co.waller.tx.us", session=session)
+
+    def lookup(self, account: str) -> TaxStatus:
+        acct = str(account).strip().upper()
+        st = super().lookup(f"R{acct}" if acct.isdigit() else acct)
+        if not st.verified:
+            return st
+        st.source_name = ("County Tax Office (does not include Waller ISD or City of "
+                          "Prairie View taxes, billed separately)")
+        page = getattr(self, "last_html", "")
+        st.payments_available = "divPaymentHistory" in page
+        m = re.search(r'(?s)id="tblPaymentHistoryData".*?</table>', page)
+        for row in re.findall(r"(?s)<tr[^>]*>(.*?)</tr>", m.group(0) if m else ""):
+            cells = [_txt(c) for c in re.findall(r"(?s)<td[^>]*>(.*?)</td>", row)]
+            # [tax year, transaction date, effective date, amount, receipt]
+            d = re.match(r"^(\d{1,2})-(\d{1,2})-(\d{4})$", cells[1]) if len(cells) >= 4 else None
+            amt = _money(cells[3]) if d else None
+            if amt is None:
+                continue
+            st.payments.append(Payment(date=f"{d[3]}-{int(d[1]):02d}-{int(d[2]):02d}", amount=amt,
+                                       tax_year=cells[0], kind="Payment",
+                                       payer=self.PAYER_UNKNOWN))
         return st
 
 
@@ -1308,6 +1358,8 @@ ACT_COUNTIES = {
     "SAN JACINTO": (TylerProxyTAdapter, "https://sjc-tax.us"),
     "HOOD":       (HoodCADAdapter, None),
     "EL PASO":    (ElPasoACTAdapter, "elpaso"),
+    "ANDREWS":    (PropertyTaxPaymentsAdapter, "https://andrews.propertytaxpayments.net"),
+    "WALLER":     (WallerTylerAdapter, None),
 }
 
 # Counties with no live adapter yet — each needs one before the bot can verify

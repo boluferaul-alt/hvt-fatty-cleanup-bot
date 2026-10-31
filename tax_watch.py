@@ -143,6 +143,21 @@ def already_noted(notes: list, p) -> bool:
     return False
 
 
+def new_payments(recent: list, notes: list, seen: set, minimum: float) -> list:
+    """The payments a note may call new.
+
+    A payment is old if we already reported it, or if it is dated on or before
+    one we reported: that run saw it too. Until 10/31/26 a note named only the
+    newest payment, so the others came back the next week as a new "TAXES PAID"
+    (Arredondo $2,947 + $1,053 both on 10/20; Rodriguez $200 on 10/22 + $500 on
+    10/20, each balance unchanged). build_note now names every new payment.
+    """
+    reported = [p.date or "" for p in recent
+                if payment_key(p) in seen or already_noted(notes, p)]
+    newest = max(reported, default="")
+    return [p for p in recent if p.amount >= minimum and (p.date or "") > newest]
+
+
 TAX_NOTE_TAG = "TAX UPDATE"
 
 
@@ -242,6 +257,8 @@ def build_note(status, payments, today_str: str) -> str:
         newest = payments[0]
         note = (f"{TAX_NOTE_TAG} {today_str} - TAXES PAID: {payment_fragment(newest)}. "
                 f"Balance still owed: ${status.total_due:,.2f}.")
+        if payments[1:]:
+            note += " Also " + "; ".join(payment_fragment(p) for p in payments[1:]) + "."
         if len(payments) >= 3:
             total = sum(p.amount for p in payments)
             note += (f" HEADS UP: active payment plan - {len(payments)} payments totaling "
@@ -677,9 +694,7 @@ def process(client, lead, stage_name, lookback, dry_run, cache, posted, today_st
 
     recent = status.payments_within(lookback)
     seen = set(posted.get(str(lead_id), []))
-    fresh = [p for p in recent
-             if p.amount >= MIN_PAYMENT
-             and payment_key(p) not in seen and not already_noted(notes, p)]
+    fresh = new_payments(recent, notes, seen, MIN_PAYMENT)
 
     if not fresh:
         # Raul 2026-07-20: still write a note when nothing was paid, so
