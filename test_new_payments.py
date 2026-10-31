@@ -40,6 +40,12 @@ def main() -> None:
     assert "$200.00 on 10/22/26" in text and "$500.00 on 10/20/26" in text
     assert new_payments(recent, note(text), set(), 1) == []
 
+    # Three receipts on one day are one payment, three payment days are a plan.
+    one_day = [pay("2026-10-26", 399.13), pay("2026-10-26", 325.63), pay("2026-10-26", 75.24)]
+    assert "payment plan" not in build_note(st, one_day, "10/31/26")
+    three_days = [pay("2026-10-28", 50.0), pay("2026-10-26", 50.0), pay("2026-10-22", 50.0)]
+    assert "payment plan" in build_note(st, three_days, "10/31/26")
+
     print("ALL PASS")
 
 

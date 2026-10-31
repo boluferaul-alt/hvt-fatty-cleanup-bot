@@ -259,7 +259,10 @@ def build_note(status, payments, today_str: str) -> str:
                 f"Balance still owed: ${status.total_due:,.2f}.")
         if payments[1:]:
             note += " Also " + "; ".join(payment_fragment(p) for p in payments[1:]) + "."
-        if len(payments) >= 3:
+        # Three payment DAYS, not three receipts: Waller splits one payment into a
+        # receipt per tax year, so 3 receipts on one date is a single payment.
+        days = len({p.date for p in payments})
+        if days >= 3:
             total = sum(p.amount for p in payments)
             note += (f" HEADS UP: active payment plan - {len(payments)} payments totaling "
                      f"${total:,.2f} in the window (owner is paying it down).")
